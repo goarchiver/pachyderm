@@ -265,10 +265,27 @@ func doSidecarMode(config interface{}) (retErr error) {
 	// The sidecar only needs to serve traffic on the peer port, as it only serves
 	// traffic from the user container (the worker binary and occasionally user
 	// pipelines)
+	fmt.Printf(">>> server.ListenTCP(\"\", %d)\n", env.PeerPort)
 	if _, err := server.ListenTCP("", env.PeerPort); err != nil {
 		return err
 	}
-	return server.Wait()
+	errChan := make(chan error, 1)
+	go waitForError("Internal PFS GRPC Server", errChan, true, func() error {
+		return server.Wait()
+	})
+	go waitForError("S3 Server", errChan, true, func() error {
+		server, err := s3.Server(env.S3GatewayPort, env.Port)
+		if err != nil {
+			return err
+		}
+		certPath, keyPath, err := tls.GetCertPaths()
+		if err != nil {
+			log.Warnf("s3gateway TLS disabled: %v", err)
+			return server.ListenAndServe()
+		}
+		return server.ListenAndServeTLS(certPath, keyPath)
+	})
+	return <-errChan
 }
 
 func doFullMode(config interface{}) (retErr error) {

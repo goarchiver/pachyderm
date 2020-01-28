@@ -564,6 +564,10 @@ func (a *apiServer) createWorkerSvcAndRc(ctx context.Context, ptr *pps.EtcdPipel
 					Name: "grpc-port",
 				},
 				{
+					Port: int32(a.env.S3GatewayPort),
+					Name: "s3-gateway-port",
+				},
+				{
 					Port: worker.PrometheusPort,
 					Name: "prometheus-metrics",
 				},
