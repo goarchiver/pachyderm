@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 
@@ -38,7 +39,9 @@ const (
 // Parameters used when creating the kubernetes replication controller in charge
 // of a job or pipeline's workers
 type workerOptions struct {
-	rcName string // Name of the replication controller managing workers
+	rcName            string // Name of the replication controller managing workers
+	s3ServiceHostPort string // s3 gateway service name (if any s3 pipeline inputs)
+	specCommit        string // Pipeline spec commit ID (needed for s3 inputs)
 
 	userImage        string              // The user's pipeline/job image
 	labels           map[string]string   // k8s labels attached to the RC and workers
@@ -65,6 +68,8 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 	if pullPolicy == "" {
 		pullPolicy = "IfNotPresent"
 	}
+
+	// Set up sidecar env vars
 	sidecarEnv := []v1.EnvVar{{
 		Name:  "BLOCK_CACHE_BYTES",
 		Value: options.cacheSize,
@@ -96,9 +101,21 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 		return v1.PodSpec{}, err
 	}
 	sidecarEnv = append(sidecarEnv, storageEnvVars...)
-	workerEnv := options.workerEnv
+	if options.s3ServiceHostPort != "" {
+		sidecarEnv = append(sidecarEnv, v1.EnvVar{
+			Name:  client.PPSSpecCommitEnv,
+			Value: options.specCommit,
+		})
+	}
+
+	// Set up worker env vars
+	workerEnv := append(options.workerEnv, v1.EnvVar{
+		Name:  client.PPSSpecCommitEnv,
+		Value: options.specCommit,
+	})
 	workerEnv = append(workerEnv, v1.EnvVar{Name: "PACH_ROOT", Value: a.storageRoot})
 	workerEnv = append(workerEnv, assets.GetSecretEnvVars(a.storageBackend)...)
+
 	// This only happens in local deployment.  We want the workers to be
 	// able to read from/write to the hostpath volume as well.
 	storageVolumeName := "pach-disk"
@@ -141,11 +158,47 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 	sidecarVolumeMounts = append(sidecarVolumeMounts, secretMount)
 	userVolumeMounts = append(userVolumeMounts, secretMount)
 
+	// Set up resource requests/limits
 	// Explicitly set CPU, MEM and DISK requests to zero because some cloud
 	// providers set their own defaults which are usually not what we want.
 	cpuZeroQuantity := resource.MustParse("0")
 	memZeroQuantity := resource.MustParse("0M")
 	memSidecarQuantity := resource.MustParse(options.cacheSize)
+	workerResources := v1.ResourceRequirements{
+		Requests: map[v1.ResourceName]resource.Quantity{
+			v1.ResourceCPU:    cpuZeroQuantity,
+			v1.ResourceMemory: memSidecarQuantity,
+		},
+	}
+	if options.resourceRequests != nil {
+		workerResources.Requests = *options.resourceRequests
+	}
+	if options.resourceLimits != nil {
+		workerResources.Limits = *options.resourceLimits
+	}
+	sidecarResources := v1.ResourceRequirements{
+		Requests: map[v1.ResourceName]resource.Quantity{
+			v1.ResourceCPU:    cpuZeroQuantity,
+			v1.ResourceMemory: memZeroQuantity,
+		},
+	}
+
+	// set up sidecar ports
+	// TODO fix up this part (v1.Port is not a thing. env.SidecarS3Port isn't defined)
+	var sidecarPorts []v1.ContainerPort
+	if options.s3ServiceHostPort != "" {
+		_, port, err := net.SplitHostPort(options.s3ServiceHostPort)
+		if err != nil {
+			return v1.PodSpec{}, fmt.Errorf("could not separate host and port in s3 hostport %q: %v", options.s3ServiceHostPort, err)
+		}
+		porti, err := strconv.ParseInt(port, 10, 32)
+		if err != nil {
+			return v1.PodSpec{}, fmt.Errorf("could not convert s3 port %q to int32: %v", port, err)
+		}
+		sidecarPorts = append(sidecarPorts, v1.ContainerPort{
+			ContainerPort: int32(porti),
+		})
+	}
 
 	if !a.noExposeDockerSocket {
 		options.volumes = append(options.volumes, v1.Volume{
@@ -191,13 +244,8 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 				Command:         []string{"/pach-bin/worker"},
 				ImagePullPolicy: v1.PullPolicy(pullPolicy),
 				Env:             workerEnv,
-				Resources: v1.ResourceRequirements{
-					Requests: map[v1.ResourceName]resource.Quantity{
-						v1.ResourceCPU:    cpuZeroQuantity,
-						v1.ResourceMemory: memZeroQuantity,
-					},
-				},
-				VolumeMounts: userVolumeMounts,
+				Resources:       workerResources,
+				VolumeMounts:    userVolumeMounts,
 			},
 			{
 				Name:            client.PPSWorkerSidecarContainerName,
@@ -206,12 +254,7 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 				ImagePullPolicy: v1.PullPolicy(pullPolicy),
 				Env:             sidecarEnv,
 				VolumeMounts:    sidecarVolumeMounts,
-				Resources: v1.ResourceRequirements{
-					Requests: map[v1.ResourceName]resource.Quantity{
-						v1.ResourceCPU:    cpuZeroQuantity,
-						v1.ResourceMemory: memSidecarQuantity,
-					},
-				},
+				Resources:       sidecarResources,
 			},
 		},
 		RestartPolicy:                 "Always",
@@ -224,19 +267,7 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 		podSpec.NodeSelector = options.schedulingSpec.NodeSelector
 		podSpec.PriorityClassName = options.schedulingSpec.PriorityClassName
 	}
-	resourceRequirements := v1.ResourceRequirements{
-		Requests: map[v1.ResourceName]resource.Quantity{
-			v1.ResourceCPU:    cpuZeroQuantity,
-			v1.ResourceMemory: memZeroQuantity,
-		},
-	}
-	if options.resourceRequests != nil {
-		resourceRequirements.Requests = *options.resourceRequests
-	}
-	if options.resourceLimits != nil {
-		resourceRequirements.Limits = *options.resourceLimits
-	}
-	podSpec.Containers[0].Resources = resourceRequirements
+
 	if options.podSpec != "" || options.podPatch != "" {
 		jsonPodSpec, err := json.Marshal(&podSpec)
 		if err != nil {
@@ -289,6 +320,40 @@ func getStorageEnvVars() ([]v1.EnvVar, error) {
 func hashAuthToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// containsS3Inputs returns 'true' if 'in' is or contains any PFS inputs with
+// 'S3' set to true. Any pipelines with s3 inputs lj
+func containsS3Inputs(in *pps.Input) (bool, error) {
+	anyS3Inputs := func(inputs []*pps.Input) (bool, error) {
+		for _, in := range inputs {
+			s3inputs, err := containsS3Inputs(in)
+			if err != nil {
+				return false, err
+			}
+			if s3inputs {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	switch {
+	case in.Pfs != nil && in.Pfs.S3:
+		return true, nil
+	case in.Union != nil:
+		return anyS3Inputs(in.Union)
+	case in.Cross != nil:
+		return anyS3Inputs(in.Cross)
+	case in.Join != nil:
+		return anyS3Inputs(in.Join)
+	case in.Cron != nil,
+		in.Git != nil,
+		in.Pfs != nil && !in.Pfs.S3:
+		return false, nil
+	default:
+		return false, fmt.Errorf("could not check for s3 inputs in unrecognized input type: %v", in)
+	}
 }
 
 func (a *apiServer) getWorkerOptions(ptr *pps.EtcdPipelineInfo, pipelineInfo *pps.PipelineInfo) (*workerOptions, error) {
@@ -360,10 +425,6 @@ func (a *apiServer) getWorkerOptions(ptr *pps.EtcdPipelineInfo, pipelineInfo *pp
 	workerEnv = append(workerEnv, v1.EnvVar{
 		Name:  client.PPSNamespaceEnv,
 		Value: a.namespace,
-	})
-	workerEnv = append(workerEnv, v1.EnvVar{
-		Name:  client.PPSSpecCommitEnv,
-		Value: ptr.SpecCommit.ID,
 	})
 	workerEnv = append(workerEnv, v1.EnvVar{
 		Name:  client.PPSPipelineNameEnv,
@@ -466,25 +527,34 @@ func (a *apiServer) getWorkerOptions(ptr *pps.EtcdPipelineInfo, pipelineInfo *pp
 			}
 		}
 	}
+	s3ServiceHostPort := ""
+	if ok, err := containsS3Inputs(pipelineInfo.Input); err == nil && ok {
+		// TODO(msteffen) do we need a separate option for the sidecar port
+		s3ServiceHostPort = fmt.Sprintf("%s-s3:%d", pipelineName, a.env.S3GatewayPort)
+	} else if err != nil {
+		return nil, fmt.Errorf("error checking for s3 inputs: %v", err)
+	}
 
 	// Generate options for new RC
 	return &workerOptions{
-		rcName:           rcName,
-		labels:           labels,
-		annotations:      annotations,
-		parallelism:      int32(0), // pipelines start w/ 0 workers & are scaled up
-		resourceRequests: resourceRequests,
-		resourceLimits:   resourceLimits,
-		userImage:        userImage,
-		workerEnv:        workerEnv,
-		volumes:          volumes,
-		volumeMounts:     volumeMounts,
-		imagePullSecrets: imagePullSecrets,
-		cacheSize:        pipelineInfo.CacheSize,
-		service:          service,
-		schedulingSpec:   pipelineInfo.SchedulingSpec,
-		podSpec:          pipelineInfo.PodSpec,
-		podPatch:         pipelineInfo.PodPatch,
+		rcName:            rcName,
+		s3ServiceHostPort: s3ServiceHostPort,
+		specCommit:        ptr.SpecCommit.ID,
+		labels:            labels,
+		annotations:       annotations,
+		parallelism:       int32(0), // pipelines start w/ 0 workers & are scaled up
+		resourceRequests:  resourceRequests,
+		resourceLimits:    resourceLimits,
+		userImage:         userImage,
+		workerEnv:         workerEnv,
+		volumes:           volumes,
+		volumeMounts:      volumeMounts,
+		imagePullSecrets:  imagePullSecrets,
+		cacheSize:         pipelineInfo.CacheSize,
+		service:           service,
+		schedulingSpec:    pipelineInfo.SchedulingSpec,
+		podSpec:           pipelineInfo.PodSpec,
+		podPatch:          pipelineInfo.PodPatch,
 	}, nil
 }
 
@@ -562,10 +632,6 @@ func (a *apiServer) createWorkerSvcAndRc(ctx context.Context, ptr *pps.EtcdPipel
 				{
 					Port: int32(a.workerGrpcPort),
 					Name: "grpc-port",
-				},
-				{
-					Port: int32(a.env.S3GatewayPort),
-					Name: "s3-gateway-port",
 				},
 				{
 					Port: worker.PrometheusPort,
