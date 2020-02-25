@@ -55,6 +55,11 @@ type PachdSpecificConfiguration struct {
 	S3GatewayPort              uint16 `env:"S3GATEWAY_PORT,default=600"`
 	DeploymentID               string `env:"CLUSTER_DEPLOYMENT_ID,default="`
 	RequireCriticalServersOnly bool   `env:"REQUIRE_CRITICAL_SERVERS_ONLY",default=false"`
+
+	// PPSSpecCommitID is only set for sidecar pachd instances. It exists so the
+	// sidecar can inspect its pipeline's spec and determine whether it needs to
+	// deploy the S3 gateway
+	PPSSpecCommitID string `env:"PPS_SPEC_COMMIT,required"`
 }
 
 // StorageConfiguration contains the storage configuration.
