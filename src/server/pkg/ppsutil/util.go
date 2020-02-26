@@ -304,3 +304,37 @@ func UpdateJobState(pipelines col.ReadWriteCollection, jobs col.ReadWriteCollect
 	jobPtr.Reason = reason
 	return jobs.Put(jobPtr.Job.ID, jobPtr)
 }
+
+// ContainsS3Inputs returns 'true' if 'in' is or contains any PFS inputs with
+// 'S3' set to true. Any pipelines with s3 inputs lj
+func ContainsS3Inputs(in *pps.Input) (bool, error) {
+	anyS3Inputs := func(inputs []*pps.Input) (bool, error) {
+		for _, in := range inputs {
+			s3inputs, err := ContainsS3Inputs(in)
+			if err != nil {
+				return false, err
+			}
+			if s3inputs {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	switch {
+	case in.Pfs != nil && in.Pfs.S3:
+		return true, nil
+	case in.Union != nil:
+		return anyS3Inputs(in.Union)
+	case in.Cross != nil:
+		return anyS3Inputs(in.Cross)
+	case in.Join != nil:
+		return anyS3Inputs(in.Join)
+	case in.Cron != nil,
+		in.Git != nil,
+		in.Pfs != nil && !in.Pfs.S3:
+		return false, nil
+	default:
+		return false, fmt.Errorf("could not check for s3 inputs in unrecognized input type: %v", in)
+	}
+}
