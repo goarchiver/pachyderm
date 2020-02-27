@@ -183,8 +183,7 @@ func (a *apiServer) workerPodSpec(options *workerOptions) (v1.PodSpec, error) {
 		},
 	}
 
-	// set up sidecar ports
-	// TODO fix up this part (v1.Port is not a thing. env.SidecarS3Port isn't defined)
+	// possibly expose s3 gateway port in the sidecar container
 	var sidecarPorts []v1.ContainerPort
 	if options.s3ServiceHostPort != "" {
 		_, port, err := net.SplitHostPort(options.s3ServiceHostPort)
