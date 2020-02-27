@@ -49,12 +49,8 @@ func (a *apiServer) ServeSidecarS3G() error {
 	}, backoff.New10sBackOff()); err != nil {
 		return fmt.Errorf("error starting sidecar s3 gateway: %v", err)
 	}
-	if hasS3, err := ppsutil.ContainsS3Inputs(s.pipelineInfo.Input); err == nil && !hasS3 {
+	if !ppsutil.ContainsS3Inputs(s.pipelineInfo.Input) && !s.pipelineInfo.S3Out {
 		return nil // nothing to serve via S3 gateway
-	} else if err != nil {
-		pipeline := s.pipelineInfo.Pipeline.Name
-		return fmt.Errorf("sidecar s3g could not check %q for s3 inputs: %v",
-			pipeline, err)
 	}
 
 	return s.Serve()
