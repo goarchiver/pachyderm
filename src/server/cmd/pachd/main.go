@@ -265,27 +265,10 @@ func doSidecarMode(config interface{}) (retErr error) {
 	// The sidecar only needs to serve traffic on the peer port, as it only serves
 	// traffic from the user container (the worker binary and occasionally user
 	// pipelines)
-	fmt.Printf(">>> server.ListenTCP(\"\", %d)\n", env.PeerPort)
 	if _, err := server.ListenTCP("", env.PeerPort); err != nil {
 		return err
 	}
-	errChan := make(chan error, 1)
-	go waitForError("Internal PFS GRPC Server", errChan, true, func() error {
-		return server.Wait()
-	})
-	go waitForError("S3 Server", errChan, true, func() error {
-		server, err := s3.Server(env.S3GatewayPort, env.Port)
-		if err != nil {
-			return err
-		}
-		certPath, keyPath, err := tls.GetCertPaths()
-		if err != nil {
-			log.Warnf("s3gateway TLS disabled: %v", err)
-			return server.ListenAndServe()
-		}
-		return server.ListenAndServeTLS(certPath, keyPath)
-	})
-	return <-errChan
+	return server.Wait()
 }
 
 func doFullMode(config interface{}) (retErr error) {
@@ -294,7 +277,7 @@ func doFullMode(config interface{}) (retErr error) {
 			pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
 		}
 	}()
-	// must run InstallJaegerTracer before InitWithKube
+	// must run InstallJaegerTracer before InitWithKube/pach client initialization
 	if endpoint := tracing.InstallJaegerTracerFromEnv(); endpoint != "" {
 		log.Printf("connecting to Jaeger at %q", endpoint)
 	} else {
