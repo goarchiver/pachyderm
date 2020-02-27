@@ -2083,6 +2083,8 @@ func (a *APIServer) processDatums(pachClient *client.APIClient, logger *taggedLo
 					a.cancel = cancel
 					a.stats = stats
 				}()
+				// TODO(msteffen) if all inputs and output are S3 intputs/output, should
+				// we still create /pfs?
 				if err := os.MkdirAll(client.PPSInputPrefix, 0777); err != nil {
 					return err
 				}
