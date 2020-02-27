@@ -60,7 +60,8 @@ func (a *APIServer) getWorkerLogger() *taggedLogger {
 }
 
 func (a *APIServer) master(masterType string, spawner func(*client.APIClient) error) {
-	masterLock := dlock.NewDLock(a.etcdClient, path.Join(a.etcdPrefix, masterLockPath, a.pipelineInfo.Pipeline.Name, a.pipelineInfo.Salt))
+	masterLock := dlock.NewDLock(a.env.GetEtcdClient(),
+		path.Join(a.etcdPrefix, masterLockPath, a.pipelineInfo.Pipeline.Name, a.pipelineInfo.Salt))
 	logger := a.getMasterLogger()
 	b := backoff.NewInfiniteBackOff()
 	// Setting a high backoff so that when this master fails, the other
@@ -87,7 +88,7 @@ func (a *APIServer) master(masterType string, spawner func(*client.APIClient) er
 	}, b, func(err error, d time.Duration) error {
 		if auth.IsErrNotAuthorized(err) {
 			logger.Logf("failing %q due to auth rejection", a.pipelineInfo.Pipeline.Name)
-			return ppsutil.FailPipeline(a.pachClient.Ctx(), a.etcdClient, a.pipelines,
+			return ppsutil.FailPipeline(a.pachClient.Ctx(), a.env.GetEtcdClient(), a.pipelines,
 				a.pipelineInfo.Pipeline.Name, "worker master could not access output "+
 					"repo to watch for new commits")
 		}
@@ -338,7 +339,7 @@ func (a *APIServer) serviceSpawner(pachClient *client.APIClient) error {
 		defer serviceCancel() // make go vet happy: infinite loop obviates 'defer'
 		go func() {
 			serviceCtx := serviceCtx
-			if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+			if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 				jobs := a.jobs.ReadWrite(stm)
 				jobPtr := &pps.EtcdJobInfo{}
 				if err := jobs.Get(job.ID, jobPtr); err != nil {
@@ -354,7 +355,7 @@ func (a *APIServer) serviceSpawner(pachClient *client.APIClient) error {
 			}
 			select {
 			case <-serviceCtx.Done():
-				if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+				if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 					jobs := a.jobs.ReadWrite(stm)
 					jobPtr := &pps.EtcdJobInfo{}
 					if err := jobs.Get(job.ID, jobPtr); err != nil {
@@ -393,11 +394,13 @@ func plusDuration(x *types.Duration, y *types.Duration) (*types.Duration, error)
 }
 
 func (a *APIServer) chunks(jobID string) col.Collection {
-	return col.NewCollection(a.etcdClient, path.Join(a.etcdPrefix, chunkPrefix, jobID), nil, &ChunkState{}, nil, nil)
+	return col.NewCollection(a.env.GetEtcdClient(),
+		path.Join(a.etcdPrefix, chunkPrefix, jobID), nil, &ChunkState{}, nil, nil)
 }
 
 func (a *APIServer) merges(jobID string) col.Collection {
-	return col.NewCollection(a.etcdClient, path.Join(a.etcdPrefix, mergePrefix, jobID), nil, &MergeState{}, nil, nil)
+	return col.NewCollection(a.env.GetEtcdClient(),
+		path.Join(a.etcdPrefix, mergePrefix, jobID), nil, &MergeState{}, nil, nil)
 }
 
 func newPlan(df DatumIterator, spec *pps.ChunkSpec, parallelism int, numHashtrees int64) *Plan {
@@ -486,7 +489,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 				if pfsserver.IsCommitNotFoundErr(err) || pfsserver.IsCommitDeletedErr(err) {
 					defer cancel() // whether we return error or nil, job is done
 					// Output commit was deleted. Delete job as well
-					if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+					if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 						// Delete the job if no other worker has deleted it yet
 						jobPtr := &pps.EtcdJobInfo{}
 						if err := a.jobs.ReadWrite(stm).Get(jobInfo.Job.ID, jobPtr); err != nil {
@@ -502,7 +505,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 			}
 			if commitInfo.Trees == nil {
 				defer cancel() // whether job state update succeeds or not, job is done
-				if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+				if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 					// Read an up to date version of the jobInfo so that we
 					// don't overwrite changes that have happened since this
 					// function started.
@@ -610,7 +613,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 		// crash) or mark it running. Also write the input chunks calculated above
 		// into plansCol
 		jobID := jobInfo.Job.ID
-		if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+		if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 			jobs := a.jobs.ReadWrite(stm)
 			jobPtr := &pps.EtcdJobInfo{}
 			if err := jobs.Get(jobID, jobPtr); err != nil {
@@ -634,7 +637,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 		}
 		defer func() {
 			if retErr == nil {
-				if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+				if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 					chunksCol := a.chunks(jobID).ReadWrite(stm)
 					chunksCol.DeleteAll()
 					plansCol := a.plans.ReadWrite(stm)
@@ -787,7 +790,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 		default:
 		}
 		// Increment the job's restart count
-		_, err = col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+		_, err = col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 			jobs := a.jobs.ReadWrite(stm)
 			jobID := jobInfo.Job.ID
 			jobPtr := &pps.EtcdJobInfo{}
@@ -806,7 +809,7 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 }
 
 func (a *APIServer) updateJobState(ctx context.Context, info *pps.JobInfo, state pps.JobState, reason string) error {
-	_, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+	_, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 		jobs := a.jobs.ReadWrite(stm)
 		jobID := info.Job.ID
 		jobPtr := &pps.EtcdJobInfo{}

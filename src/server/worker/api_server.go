@@ -24,7 +24,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/LK4D4/joincontext"
-	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/types"
 	"golang.org/x/net/context"
@@ -53,6 +52,7 @@ import (
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsconsts"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsdb"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsutil"
+	"github.com/pachyderm/pachyderm/src/server/pkg/serviceenv"
 	filesync "github.com/pachyderm/pachyderm/src/server/pkg/sync"
 	"github.com/pachyderm/pachyderm/src/server/pkg/uuid"
 	"github.com/pachyderm/pachyderm/src/server/pkg/watch"
@@ -86,8 +86,8 @@ var (
 
 // APIServer implements the worker API
 type APIServer struct {
+	env        serviceenv.ServiceEnv
 	pachClient *client.APIClient
-	etcdClient *etcd.Client
 	etcdPrefix string
 
 	// Information needed to process input data and upload output
@@ -316,11 +316,11 @@ func (logger *taggedLogger) userLogger() *taggedLogger {
 }
 
 // NewAPIServer creates an APIServer for a given pipeline
-func NewAPIServer(pachClient *client.APIClient, etcdClient *etcd.Client, etcdPrefix string, pipelineInfo *pps.PipelineInfo, workerName string, namespace string, hashtreeStorage string) (*APIServer, error) {
+func NewAPIServer(env serviceenv.ServiceEnv, pachClient *client.APIClient, etcdPrefix string, pipelineInfo *pps.PipelineInfo, workerName string, namespace string, hashtreeStorage string) (*APIServer, error) {
 	initPrometheus()
 
 	span, ctx := extended.AddPipelineSpanToAnyTrace(pachClient.Ctx(),
-		etcdClient, pipelineInfo.Pipeline.Name, "/worker/Start")
+		env.GetEtcdClient(), pipelineInfo.Pipeline.Name, "/worker/Start")
 	oldPachClient := pachClient // don't use tracing in apiServer.pachClient
 	if span != nil {
 		pachClient = pachClient.WithCtx(ctx)
@@ -328,20 +328,22 @@ func NewAPIServer(pachClient *client.APIClient, etcdClient *etcd.Client, etcdPre
 	defer tracing.FinishAnySpan(span)
 
 	server := &APIServer{
+		env:          env,
 		pachClient:   oldPachClient,
-		etcdClient:   etcdClient,
 		etcdPrefix:   etcdPrefix,
 		pipelineInfo: pipelineInfo,
 		logMsgTemplate: pps.LogMessage{
 			PipelineName: pipelineInfo.Pipeline.Name,
 			WorkerID:     os.Getenv(client.PPSPodNameEnv),
 		},
-		workerName:      workerName,
-		namespace:       namespace,
-		jobs:            ppsdb.Jobs(etcdClient, etcdPrefix),
-		pipelines:       ppsdb.Pipelines(etcdClient, etcdPrefix),
-		plans:           col.NewCollection(etcdClient, path.Join(etcdPrefix, planPrefix), nil, &Plan{}, nil, nil),
-		shards:          col.NewCollection(etcdClient, path.Join(etcdPrefix, shardPrefix, pipelineInfo.Pipeline.Name), nil, &ShardInfo{}, nil, nil),
+		workerName: workerName,
+		namespace:  namespace,
+		jobs:       ppsdb.Jobs(env.GetEtcdClient(), etcdPrefix),
+		pipelines:  ppsdb.Pipelines(env.GetEtcdClient(), etcdPrefix),
+		plans: col.NewCollection(env.GetEtcdClient(),
+			path.Join(etcdPrefix, planPrefix), nil, &Plan{}, nil, nil),
+		shards: col.NewCollection(env.GetEtcdClient(),
+			path.Join(etcdPrefix, shardPrefix, pipelineInfo.Pipeline.Name), nil, &ShardInfo{}, nil, nil),
 		hashtreeStorage: hashtreeStorage,
 		claimedShard:    make(chan context.Context, 1),
 		shard:           noShard,
@@ -395,7 +397,7 @@ func NewAPIServer(pachClient *client.APIClient, etcdClient *etcd.Client, etcdPre
 		}
 		if server.pipelineInfo.Transform.Cmd == nil {
 			if len(image.Config.Entrypoint) == 0 {
-				ppsutil.FailPipeline(ctx, etcdClient, server.pipelines,
+				ppsutil.FailPipeline(ctx, env.GetEtcdClient(), server.pipelines,
 					pipelineInfo.Pipeline.Name,
 					"nothing to run: no transform.cmd and no entrypoint")
 			}
@@ -1209,7 +1211,7 @@ func (a *APIServer) processChunk(ctx context.Context, jobID string, low, high in
 	if err != nil {
 		return err
 	}
-	if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+	if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 		jobs := a.jobs.ReadWrite(stm)
 		jobPtr := &pps.EtcdJobInfo{}
 		if err := jobs.Update(jobID, jobPtr, func() error {
@@ -1358,7 +1360,7 @@ func (a *APIServer) mergeDatums(jobCtx context.Context, pachClient *client.APICl
 				return err
 			}
 			// mark merge as complete
-			_, err = col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+			_, err = col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 				merges := a.merges(jobID).ReadWrite(stm)
 				return merges.Put(fmt.Sprint(a.shard), &MergeState{State: State_COMPLETE, Tree: tree, SizeBytes: size, StatsTree: statsTree, StatsSizeBytes: statsSize})
 			})
@@ -2193,7 +2195,7 @@ func (a *APIServer) processDatums(pachClient *client.APIClient, logger *taggedLo
 		result.recoveredDatums = recoveredDatumsObj
 	}
 
-	if _, err := col.NewSTM(ctx, a.etcdClient, func(stm col.STM) error {
+	if _, err := col.NewSTM(ctx, a.env.GetEtcdClient(), func(stm col.STM) error {
 		jobs := a.jobs.ReadWrite(stm)
 		jobID := jobInfo.Job.ID
 		jobPtr := &pps.EtcdJobInfo{}
