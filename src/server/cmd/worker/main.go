@@ -127,7 +127,7 @@ func getPipelineInfo(pachClient *client.APIClient, env *serviceenv.ServiceEnv) (
 func do(config interface{}) error {
 	// must run InstallJaegerTracer before InitWithKube/pach client initialization
 	tracing.InstallJaegerTracerFromEnv()
-	env := serviceenv.InitServiceEnv(serviceenv.NewConfiguration(config))
+	env := serviceenv.InitWithKube(serviceenv.NewConfiguration(config))
 
 	// Construct a client that connects to the sidecar.
 	pachClient := env.GetPachClient(context.Background())
@@ -138,7 +138,7 @@ func do(config interface{}) error {
 
 	// Construct worker API server.
 	workerRcName := ppsutil.PipelineRcName(pipelineInfo.Pipeline.Name, pipelineInfo.Version)
-	apiServer, err := worker.NewAPIServer(env, pachClient, env.PPSEtcdPrefix, pipelineInfo, env.PodName, env.Namespace, env.StorageRoot)
+	apiServer, err := worker.NewAPIServer(env, pachClient, env.GetEtcdClient(), env.PPSEtcdPrefix, pipelineInfo, env.PodName, env.Namespace, env.StorageRoot)
 	if err != nil {
 		return err
 	}

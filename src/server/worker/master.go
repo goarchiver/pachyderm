@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,9 @@ import (
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsutil"
 	filesync "github.com/pachyderm/pachyderm/src/server/pkg/sync"
 	"github.com/pachyderm/pachyderm/src/server/pkg/watch"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -468,6 +472,81 @@ func (a *APIServer) failedInputs(ctx context.Context, jobInfo *pps.JobInfo) ([]s
 	return failedInputs, vistErr
 }
 
+func (a *APIServer) createS3SidecarService(jobInfo *pps.JobInfo) (retErr error) {
+	if !ppsutil.ContainsS3Inputs(a.pipelineInfo.Input) && !a.pipelineInfo.S3Out {
+		return nil // don't create kubernetes service
+	}
+	// Create kubernetes service for the current job ('jobInfo')
+	rcName := ppsutil.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
+	labels := map[string]string{
+		"app":       rcName,
+		"suite":     "pachyderm",
+		"component": "worker",
+	}
+	service := &v1.Service{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Service",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   rcName,
+			Labels: labels,
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   strconv.Itoa(PrometheusPort),
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Selector: labels,
+			Ports: []v1.ServicePort{
+				{
+					Port: int32(a.env.S3GatewayPort),
+					Name: "s3-gateway-port",
+				},
+				{
+					Port: PrometheusPort,
+					Name: "prometheus-metrics",
+				},
+			},
+		},
+	}
+
+	if err := backoff.RetryNotify(func() error {
+		_, err := a.env.GetKubeClient().CoreV1().Services(a.namespace).Create(service)
+		return err
+	}, backoff.NewExponentialBackOff(), func(err error, d time.Duration) error {
+		if strings.Contains(err.Error(), "already exists") {
+			return err // success
+		}
+		a.getMasterLogger().Logf("error creating kubernetes service for s3 gateway sidecar: %v; retrying in %v", err, d)
+		return nil
+	}); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return err
+	}
+	return nil
+}
+
+func (a *APIServer) deleteS3SidecarService(jobInfo *pps.JobInfo) (retErr error) {
+	if !ppsutil.ContainsS3Inputs(a.pipelineInfo.Input) && !a.pipelineInfo.S3Out {
+		return nil // don't need to delete kubernetes service
+	}
+	rcName := ppsutil.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
+
+	if err := backoff.RetryNotify(func() error {
+		return a.env.GetKubeClient().CoreV1().Services(a.namespace).Delete(rcName,
+			&metav1.DeleteOptions{OrphanDependents: new(bool) /* false */})
+	}, backoff.NewExponentialBackOff(), func(err error, d time.Duration) error {
+		if strings.Contains(err.Error(), "not found") {
+			return err // success
+		}
+		a.getMasterLogger().Logf("error deleting kubernetes service for s3 gateway sidecar: %v; retrying in %v", err, d)
+		return nil
+	}); err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+	return nil
+}
+
 // waitJob waits for the job in 'jobInfo' to finish, and then it collects the
 // output from the job's workers and merges it into a commit (and may merge
 // stats into a commit in the stats branch as well)
@@ -475,6 +554,10 @@ func (a *APIServer) waitJob(pachClient *client.APIClient, jobInfo *pps.JobInfo, 
 	logger.Logf("waiting on job %q (pipeline version: %d, state: %s)", jobInfo.Job.ID, jobInfo.PipelineVersion, jobInfo.State)
 	ctx, cancel := context.WithCancel(pachClient.Ctx())
 	pachClient = pachClient.WithCtx(ctx)
+
+	// Start s3 gateway service if one is needed
+	a.createS3SidecarService(jobInfo)
+	defer a.deleteS3SidecarService(jobInfo)
 
 	// Watch the output commit to see if it's terminated (KILLED, FAILED, or
 	// SUCCESS) and if so, cancel the current context

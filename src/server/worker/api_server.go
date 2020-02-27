@@ -552,7 +552,7 @@ func (a *APIServer) downloadData(pachClient *client.APIClient, logger *taggedLog
 				}
 			}
 		}
-	} else {
+	} else if !a.pipelineInfo.S3Out {
 		if err := os.MkdirAll(outPath, 0777); err != nil {
 			return "", err
 		}
@@ -2128,7 +2128,9 @@ func (a *APIServer) processDatums(pachClient *client.APIClient, logger *taggedLo
 				}
 				atomic.AddUint64(&subStats.DownloadBytes, uint64(downSize))
 				a.reportDownloadSizeStats(float64(downSize), logger)
-				return a.uploadOutput(pachClient, dir, tag, logger, data, subStats, outputTree, datumIdx)
+				if !a.pipelineInfo.S3Out {
+					return a.uploadOutput(pachClient, dir, tag, logger, data, subStats, outputTree, datumIdx)
+				}
 			}, &backoff.ZeroBackOff{}, func(err error, d time.Duration) error {
 				if isDone(ctx) {
 					return ctx.Err() // timeout or cancelled job, err out and don't retry
