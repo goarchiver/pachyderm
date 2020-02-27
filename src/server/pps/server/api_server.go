@@ -201,8 +201,6 @@ func (a *apiServer) validateInput(pachClient *client.APIClient, pipelineName str
 					return fmt.Errorf("input cannot specify both 's3' and 'glob, as " +
 						"the first exposes repo contents via the S3 gateway, while the " +
 						"second exposes repo contents via the filesystem")
-				case input.Pfs.S3:
-					return fmt.Errorf("'s3' inputs are not supported yet")
 				}
 				// Note that input.Pfs.Commit is empty if a) this is a job b) one of
 				// the job pipeline's input branches has no commits yet
@@ -1560,8 +1558,8 @@ func (a *apiServer) validatePipelineRequest(request *pps.CreatePipelineRequest) 
 	if request.TFJob != nil {
 		return goerr.New("embedding TFJobs in pipelines is not supported yet")
 	}
-	if request.S3Out {
-		return goerr.New("s3 gateway services for PPS pipelines are not supported yet")
+	if request.S3Out && ((request.Service != nil) || (request.Spout != nil)) {
+		return goerr.New("s3 output is not supported in spouts or services")
 	}
 	if request.Transform == nil {
 		return fmt.Errorf("pipeline must specify a transform")
