@@ -7,13 +7,18 @@ import (
 	"path"
 	"sort"
 
-	"github.com/pachyderm/pachyderm/src/server/pkg/storage/fileset/index"
 	"github.com/pachyderm/pachyderm/src/server/pkg/storage/fileset/tar"
 )
 
+// TODO Might want to rework this a bit later or add some additional validation.
+type dataOp struct {
+	deleteTags map[string]struct{}
+	memFiles   map[string]*memFile
+}
+
 type memFile struct {
 	hdr  *tar.Header
-	op   index.Op
+	tag  string
 	data *bytes.Buffer
 }
 
@@ -30,29 +35,36 @@ type FileSet struct {
 	root                       string
 	memAvailable, memThreshold int64
 	name                       string
-	tag                        string
-	fs                         map[string]*memFile
+	defaultTag                 string
+	fs                         map[string]*dataOp
 	subFileSet                 int64
 }
 
-func newFileSet(ctx context.Context, storage *Storage, name string, memThreshold int64, tag string, opts ...Option) *FileSet {
+func newFileSet(ctx context.Context, storage *Storage, name string, memThreshold int64, defaultTag string, opts ...Option) (*FileSet, error) {
+	if err := storage.filesetSem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
 	f := &FileSet{
 		ctx:          ctx,
 		storage:      storage,
 		memAvailable: memThreshold,
 		memThreshold: memThreshold,
 		name:         name,
-		tag:          tag,
-		fs:           make(map[string]*memFile),
+		defaultTag:   defaultTag,
+		fs:           make(map[string]*dataOp),
 	}
 	for _, opt := range opts {
 		opt(f)
 	}
-	return f
+	return f, nil
 }
 
 // Put reads files from a tar stream and adds them to the fileset.
-func (f *FileSet) Put(r io.Reader) error {
+func (f *FileSet) Put(r io.Reader, customTag ...string) error {
+	tag := f.defaultTag
+	if len(customTag) > 0 && customTag[0] != "" {
+		tag = customTag[0]
+	}
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -62,9 +74,10 @@ func (f *FileSet) Put(r io.Reader) error {
 			}
 			return err
 		}
-		mFile := f.createFile(hdr)
+		hdr.Name = path.Join(f.root, hdr.Name)
+		mf := f.createFile(hdr, tag)
 		for {
-			n, err := io.CopyN(mFile, tr, f.memAvailable)
+			n, err := io.CopyN(mf, tr, f.memAvailable)
 			f.memAvailable -= n
 			if err != nil {
 				if err == io.EOF {
@@ -76,55 +89,73 @@ func (f *FileSet) Put(r io.Reader) error {
 				if err := f.serialize(); err != nil {
 					return err
 				}
-				mFile = f.createFile(hdr)
+				mf = f.createFile(hdr, tag)
 			}
 		}
 	}
-	return nil
 }
 
-func (f *FileSet) createFile(hdr *tar.Header) *memFile {
-	hdr.Name = path.Join(f.root, hdr.Name)
-	// Create entry for path if it does not exist.
-	if _, ok := f.fs[hdr.Name]; !ok {
-		f.createParent(hdr.Name)
-		hdr.Size = 0
-		f.fs[hdr.Name] = &memFile{
-			hdr:  hdr,
-			data: &bytes.Buffer{},
+func (f *FileSet) createFile(hdr *tar.Header, tag string) *memFile {
+	f.createParent(hdr.Name, tag)
+	hdr.Size = 0
+	mf := &memFile{
+		hdr:  hdr,
+		tag:  tag,
+		data: &bytes.Buffer{},
+	}
+	dataOp := f.getDataOp(hdr.Name)
+	dataOp.memFiles[tag] = mf
+	return mf
+}
+
+func (f *FileSet) getDataOp(name string) *dataOp {
+	if _, ok := f.fs[name]; !ok {
+		f.fs[name] = &dataOp{
+			deleteTags: make(map[string]struct{}),
+			memFiles:   make(map[string]*memFile),
 		}
 	}
-	return f.fs[hdr.Name]
+	return f.fs[name]
 }
 
-func (f *FileSet) createParent(name string) {
+func (f *FileSet) createParent(name string, tag string) {
 	name, _ = path.Split(name)
 	if _, ok := f.fs[name]; ok {
 		return
 	}
-	f.fs[name] = &memFile{
+	mf := &memFile{
 		hdr: &tar.Header{
 			Typeflag: tar.TypeDir,
 			Name:     name,
 		},
+		tag:  tag,
+		data: &bytes.Buffer{},
 	}
-	f.createParent(name)
+	dataOp := f.getDataOp(name)
+	dataOp.memFiles[tag] = mf
+	f.createParent(name, tag)
 }
 
 // Delete deletes a file from the file set.
-// (bryce) might need to delete ancestor directories in certain cases.
-func (f *FileSet) Delete(name string) {
-	name = path.Join(f.root, name)
-	if _, ok := f.fs[name]; !ok {
-		f.fs[name] = &memFile{
-			hdr: &tar.Header{
-				Name: name,
-			},
-		}
+func (f *FileSet) Delete(name string, customTag ...string) {
+	// TODO This should be a cleaning function.
+	name = path.Join(f.root, "/", name)
+	var tag string
+	if len(customTag) > 0 {
+		tag = customTag[0]
 	}
-	f.fs[name].hdr.Size = 0
-	f.fs[name].op = index.Op_DELETE
-	f.fs[name].data = nil
+	if tag == headerTag {
+		deleteTags := make(map[string]struct{})
+		deleteTags[headerTag] = struct{}{}
+		f.fs[name] = &dataOp{deleteTags: deleteTags}
+		return
+	}
+	dataOp := f.getDataOp(name)
+	if _, ok := dataOp.deleteTags[headerTag]; ok {
+		return
+	}
+	dataOp.deleteTags[tag] = struct{}{}
+	dataOp.memFiles[tag] = nil
 }
 
 // serialize will be called whenever the in-memory file set is past the memory threshold.
@@ -141,17 +172,26 @@ func (f *FileSet) serialize() error {
 	// Serialize file set.
 	w := f.storage.newWriter(f.ctx, path.Join(f.name, SubFileSetStr(f.subFileSet)))
 	for _, name := range names {
-		n := f.fs[name]
-		// (bryce) skipping serialization of deletion operations for the time being.
-		if n.op == index.Op_DELETE {
+		dataOp := f.fs[name]
+		deleteTags := getSortedTags(dataOp.deleteTags)
+		mfs := getSortedMemFiles(dataOp.memFiles)
+		if len(mfs) == 0 {
+			if err := w.DeleteFile(name, deleteTags...); err != nil {
+				return err
+			}
 			continue
 		}
-		if err := w.WriteHeader(n.hdr); err != nil {
+		// TODO Tar header validation?
+		hdr := mfs[len(mfs)-1].hdr
+		if err := w.WriteHeader(hdr); err != nil {
 			return err
 		}
-		if n.hdr.Typeflag != tar.TypeDir {
-			w.Tag(f.tag)
-			if _, err := w.Write(n.data.Bytes()); err != nil {
+		for _, tag := range deleteTags {
+			w.DeleteTag(tag)
+		}
+		for _, mf := range mfs {
+			w.Tag(mf.tag)
+			if _, err := w.Write(mf.data.Bytes()); err != nil {
 				return err
 			}
 		}
@@ -160,13 +200,34 @@ func (f *FileSet) serialize() error {
 		return err
 	}
 	// Reset in-memory file set.
-	f.fs = make(map[string]*memFile)
+	f.fs = make(map[string]*dataOp)
 	f.memAvailable = f.memThreshold
 	f.subFileSet++
 	return nil
 }
 
+func getSortedMemFiles(memFiles map[string]*memFile) []*memFile {
+	var mfs []*memFile
+	for _, mf := range memFiles {
+		mfs = append(mfs, mf)
+	}
+	sort.SliceStable(mfs, func(i, j int) bool {
+		return mfs[i].tag < mfs[j].tag
+	})
+	return mfs
+}
+
+func getSortedTags(tags map[string]struct{}) []string {
+	var tgs []string
+	for tag := range tags {
+		tgs = append(tgs, tag)
+	}
+	sort.Strings(tgs)
+	return tgs
+}
+
 // Close closes the file set.
 func (f *FileSet) Close() error {
+	defer f.storage.filesetSem.Release(1)
 	return f.serialize()
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/juju/ansiterm"
 	"github.com/pachyderm/pachyderm/src/client"
 	pfsclient "github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	ppsclient "github.com/pachyderm/pachyderm/src/client/pps"
 	"github.com/pachyderm/pachyderm/src/server/pkg/pretty"
 )
@@ -151,6 +152,9 @@ ParallelismSpec: {{.ParallelismSpec}}
   {{ if .ResourceLimits.Gpu }}GPU:
     Type: {{ .ResourceLimits.Gpu.Type }}
     Number: {{ .ResourceLimits.Gpu.Number }} {{end}} {{end}}
+{{ if .SidecarResourceLimits }}SidecarResourceLimits:
+  CPU: {{ .SidecarResourceLimits.Cpu }}
+  Memory: {{ .SidecarResourceLimits.Memory }} {{end}}
 {{ if .Service }}Service:
 	{{ if .Service.InternalPort }}InternalPort: {{ .Service.InternalPort }} {{end}}
 	{{ if .Service.ExternalPort }}ExternalPort: {{ .Service.ExternalPort }} {{end}} {{end}}Input:
@@ -193,8 +197,9 @@ Description: {{.Description}}{{end}}{{if .FullTimestamps }}
 Created: {{.CreatedAt}}{{ else }}
 Created: {{prettyAgo .CreatedAt}} {{end}}
 State: {{pipelineState .State}}
-Stopped: {{ .Stopped }}
 Reason: {{.Reason}}
+Workers Available: {{.WorkersAvailable}}/{{.WorkersRequested}}
+Stopped: {{ .Stopped }}
 Parallelism Spec: {{.ParallelismSpec}}
 {{ if .ResourceRequests }}ResourceRequests:
   CPU: {{ .ResourceRequests.Cpu }}
@@ -362,6 +367,8 @@ func pipelineState(pipelineState ppsclient.PipelineState) string {
 		return color.New(color.FgYellow).SprintFunc()("paused")
 	case ppsclient.PipelineState_PIPELINE_STANDBY:
 		return color.New(color.FgYellow).SprintFunc()("standby")
+	case ppsclient.PipelineState_PIPELINE_CRASHING:
+		return color.New(color.FgRed).SprintFunc()("crashing")
 	}
 	return "-"
 }
@@ -372,7 +379,7 @@ func jobInput(jobInfo PrintableJobInfo) string {
 	}
 	input, err := json.MarshalIndent(jobInfo.Input, "", "  ")
 	if err != nil {
-		panic(fmt.Errorf("error marshalling input: %+v", err))
+		panic(errors.Wrapf(err, "error marshalling input"))
 	}
 	return string(input) + "\n"
 }
@@ -395,7 +402,7 @@ func pipelineInput(pipelineInfo *ppsclient.PipelineInfo) string {
 	}
 	input, err := json.MarshalIndent(pipelineInfo.Input, "", "  ")
 	if err != nil {
-		panic(fmt.Errorf("error marshalling input: %+v", err))
+		panic(errors.Wrapf(err, "error marshalling input"))
 	}
 	return string(input) + "\n"
 }

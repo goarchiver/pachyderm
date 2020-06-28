@@ -1,42 +1,25 @@
 package s3
 
 import (
-	"fmt"
 	"net/http"
 
-	"github.com/gogo/protobuf/types"
-	"github.com/gorilla/mux"
 	"github.com/pachyderm/s2"
 )
 
 func (c *controller) ListBuckets(r *http.Request) (*s2.ListBucketsResult, error) {
-	vars := mux.Vars(r)
-	pc, err := c.pachClient(vars["authAccessKey"])
-	if err != nil {
-		return nil, err
-	}
-	repos, err := pc.ListRepo()
+	c.logger.Debugf("ListBuckets")
+
+	pc, err := c.requestClient(r)
 	if err != nil {
 		return nil, err
 	}
 
 	result := s2.ListBucketsResult{
 		Owner:   &defaultUser,
-		Buckets: []s2.Bucket{},
+		Buckets: []*s2.Bucket{},
 	}
-
-	for _, repo := range repos {
-		t, err := types.TimestampFromProto(repo.Created)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, branch := range repo.Branches {
-			result.Buckets = append(result.Buckets, s2.Bucket{
-				Name:         fmt.Sprintf("%s.%s", branch.Name, branch.Repo.Name),
-				CreationDate: t,
-			})
-		}
+	if err = c.driver.listBuckets(pc, r, &result.Buckets); err != nil {
+		return nil, err
 	}
 
 	return &result, nil

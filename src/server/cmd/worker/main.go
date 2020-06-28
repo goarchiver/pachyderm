@@ -2,98 +2,43 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"os"
 	"path"
-	"path/filepath"
 	"time"
 
-	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/pachyderm/pachyderm/src/client"
 	debugclient "github.com/pachyderm/pachyderm/src/client/debug"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	"github.com/pachyderm/pachyderm/src/client/version"
 	"github.com/pachyderm/pachyderm/src/client/version/versionpb"
+	"github.com/pachyderm/pachyderm/src/server/cmd/worker/assets"
 	debugserver "github.com/pachyderm/pachyderm/src/server/debug/server"
 	"github.com/pachyderm/pachyderm/src/server/pkg/cmdutil"
 	logutil "github.com/pachyderm/pachyderm/src/server/pkg/log"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsutil"
 	"github.com/pachyderm/pachyderm/src/server/pkg/serviceenv"
 	"github.com/pachyderm/pachyderm/src/server/worker"
+	workerserver "github.com/pachyderm/pachyderm/src/server/worker/server"
 
+	etcd "github.com/coreos/etcd/clientv3"
 	log "github.com/sirupsen/logrus"
 )
 
 func main() {
 	log.SetFormatter(logutil.FormatterFunc(logutil.Pretty))
 
-	// Copy the contents of /pach-bin/certs into /etc/ssl/certs. Don't return an
-	// error (which would cause 'Walk()' to exit early) but do record if any certs
-	// are known to be missing so we can inform the user
-	copyErr := false
-	if err := filepath.Walk("/pach-bin/certs", func(inPath string, info os.FileInfo, err error) error {
-		if err != nil {
-			log.Warnf("skipping \"%s\", could not stat path: %v", inPath, err)
-			copyErr = true
-			return nil // Don't try and fix any errors encountered by Walk() itself
-		}
-		if info.IsDir() {
-			return nil // We'll just copy the children of any directories when we traverse them
-		}
-
-		// Open input file (src)
-		in, err := os.OpenFile(inPath, os.O_RDONLY, 0)
-		if err != nil {
-			log.Warnf("could not read \"%s\": %v", inPath, err)
-			copyErr = true
-			return nil
-		}
-		defer in.Close()
-
-		// Create output file (dest) and open for writing
-		outRelPath, err := filepath.Rel("/pach-bin/certs", inPath)
-		if err != nil {
-			log.Warnf("skipping \"%s\", could not extract relative path: %v", inPath, err)
-			copyErr = true
-			return nil
-		}
-		outPath := filepath.Join("/etc/ssl/certs", outRelPath)
-		outDir := filepath.Dir(outPath)
-		if err := os.MkdirAll(outDir, 0755); err != nil {
-			log.Warnf("skipping \"%s\", could not create directory \"%s\": %v", inPath, outDir, err)
-			copyErr = true
-			return nil
-		}
-		out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-		if err != nil {
-			log.Warnf("skipping \"%s\", could not create output file \"%s\": %v", inPath, outPath, err)
-			copyErr = true
-			return nil
-		}
-		defer out.Close()
-
-		// Copy src -> dest
-		if _, err := io.Copy(out, in); err != nil {
-			log.Warnf("could not copy \"%s\" to \"%s\": %v", inPath, outPath, err)
-			copyErr = true
-			return nil
-		}
-		return nil
-	}); err != nil {
-		// Should never happen, but just log if it does
-		copyErr = true
-		log.Warnf("walk failed with: %v", err)
+	// Copy certs embedded via go-bindata to /etc/ssl/certs. Because the
+	// container running this app is user-specified, we don't otherwise have
+	// control over the certs that are available.
+	//
+	// If an error occurs, don't hard-fail, but do record if any certs are
+	// known to be missing so we can inform the user.
+	if err := assets.RestoreAssets("/", "etc/ssl/certs"); err != nil {
+		log.Warnf("failed to inject TLS certs: %v", err)
 	}
-	if copyErr {
-		log.Warnf(
-			"pachyderm's worker binary encountered errors while copying " +
-				"/pach-bin/certs to /etc/ssl/certs (see above). This might cause the " +
-				"worker binary to error while communicating with object storage for " +
-				"egress pipelines or for merging pipeline outputs")
-	}
+
 	cmdutil.Main(do, &serviceenv.WorkerFullConfiguration{})
 }
 
@@ -109,7 +54,7 @@ func getPipelineInfo(pachClient *client.APIClient, env *serviceenv.ServiceEnv) (
 		return nil, err
 	}
 	if len(resp.Kvs) != 1 {
-		return nil, fmt.Errorf("expected to find 1 pipeline (%s), got %d: %v", env.PPSPipelineName, len(resp.Kvs), resp)
+		return nil, errors.Errorf("expected to find 1 pipeline (%s), got %d: %v", env.PPSPipelineName, len(resp.Kvs), resp)
 	}
 	var pipelinePtr pps.EtcdPipelineInfo
 	if err := pipelinePtr.Unmarshal(resp.Kvs[0].Value); err != nil {
@@ -125,21 +70,20 @@ func getPipelineInfo(pachClient *client.APIClient, env *serviceenv.ServiceEnv) (
 }
 
 func do(config interface{}) error {
-	tracing.InstallJaegerTracerFromEnv() // must run before InitServiceEnv
+	// must run InstallJaegerTracer before InitWithKube/pach client initialization
+	tracing.InstallJaegerTracerFromEnv()
 	env := serviceenv.InitServiceEnv(serviceenv.NewConfiguration(config))
 
 	// Construct a client that connects to the sidecar.
 	pachClient := env.GetPachClient(context.Background())
-
-	// Get etcd client, so we can register our IP (so pachd can discover us)
-	pipelineInfo, err := getPipelineInfo(pachClient, env)
+	pipelineInfo, err := getPipelineInfo(pachClient, env) // get pipeline creds for pachClient
 	if err != nil {
-		return fmt.Errorf("error getting pipelineInfo: %v", err)
+		return errors.Wrapf(err, "error getting pipelineInfo")
 	}
 
 	// Construct worker API server.
 	workerRcName := ppsutil.PipelineRcName(pipelineInfo.Pipeline.Name, pipelineInfo.Version)
-	apiServer, err := worker.NewAPIServer(pachClient, env.GetEtcdClient(), env.PPSEtcdPrefix, pipelineInfo, env.PodName, env.Namespace, env.StorageRoot)
+	workerInstance, err := worker.NewWorker(pachClient, env.GetEtcdClient(), env.PPSEtcdPrefix, pipelineInfo, env.PodName, env.Namespace, env.StorageRoot, "/")
 	if err != nil {
 		return err
 	}
@@ -150,32 +94,33 @@ func do(config interface{}) error {
 		return err
 	}
 
-	worker.RegisterWorkerServer(server.Server, apiServer)
+	workerserver.RegisterWorkerServer(server.Server, workerInstance.APIServer)
 	versionpb.RegisterAPIServer(server.Server, version.NewAPIServer(version.Version, version.APIServerOptions{}))
-	debugclient.RegisterDebugServer(server.Server, debugserver.NewDebugServer(env.PodName, env.GetEtcdClient(), env.PPSEtcdPrefix, env.PPSWorkerPort, ""))
+	debugclient.RegisterDebugServer(server.Server, debugserver.NewDebugServer(env.PodName, env.GetEtcdClient(), env.PPSEtcdPrefix, env.PPSWorkerPort, "", pachClient))
 
 	// Put our IP address into etcd, so pachd can discover us
-	key := path.Join(env.PPSEtcdPrefix, worker.WorkerEtcdPrefix, workerRcName, env.PPSWorkerIP)
+	key := path.Join(env.PPSEtcdPrefix, workerserver.WorkerEtcdPrefix, workerRcName, env.PPSWorkerIP)
 
 	// Prepare to write "key" into etcd by creating lease -- if worker dies, our
 	// IP will be removed from etcd
 	ctx, cancel := context.WithTimeout(pachClient.Ctx(), 10*time.Second)
 	defer cancel()
+
 	resp, err := env.GetEtcdClient().Grant(ctx, 10 /* seconds */)
 	if err != nil {
-		return fmt.Errorf("error granting lease: %v", err)
+		return errors.Wrapf(err, "error granting lease")
 	}
 
 	// keepalive forever
 	if _, err := env.GetEtcdClient().KeepAlive(context.Background(), resp.ID); err != nil {
-		return fmt.Errorf("error with KeepAlive: %v", err)
+		return errors.Wrapf(err, "error with KeepAlive")
 	}
 
 	// Actually write "key" into etcd
 	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second) // new ctx
 	defer cancel()
 	if _, err := env.GetEtcdClient().Put(ctx, key, "", etcd.WithLease(resp.ID)); err != nil {
-		return fmt.Errorf("error putting IP address: %v", err)
+		return errors.Wrapf(err, "error putting IP address")
 	}
 
 	// If server ever exits, return error

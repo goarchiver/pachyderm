@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/pachyderm/pachyderm/src/client"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tls"
 	auth "github.com/pachyderm/pachyderm/src/server/auth/server"
 	pfs "github.com/pachyderm/pachyderm/src/server/pfs/server"
@@ -15,12 +17,21 @@ import (
 	"github.com/pachyderm/pachyderm/src/server/pkg/serde"
 	"github.com/pachyderm/pachyderm/src/server/pkg/uuid"
 	"github.com/pachyderm/pachyderm/src/server/pps/server/githook"
+
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+const (
+	// WorkerSAName is the name of the service account that pachyderm
+	// pipelines use to create an s3 gateway service for each job
+	WorkerSAName          = "pachyderm-worker"
+	workerRoleName        = "pachyderm-worker" // Role given to worker SA
+	workerRoleBindingName = "pachyderm-worker" // Binding worker role to SA
 )
 
 var (
@@ -30,7 +41,8 @@ var (
 	// Using our own etcd image for now because there's a fix we need
 	// that hasn't been released, and which has been manually applied
 	// to the official v3.2.7 release.
-	etcdImage      = "quay.io/coreos/etcd:v3.3.5"
+	etcdImage      = "pachyderm/etcd:v3.3.5"
+	postgresImage  = "postgres:11.3"
 	grpcProxyImage = "pachyderm/grpc-proxy:0.4.10"
 	dashName       = "dash"
 	workerImage    = "pachyderm/worker"
@@ -50,6 +62,11 @@ var (
 	pachdName                   = "pachd"
 	// PrometheusPort hosts the prometheus stats for scraping
 	PrometheusPort = 656
+
+	postgresName                    = "postgres"
+	postgresVolumeName              = "postgres-volume"
+	postgresVolumeClaimName         = "postgres-storage"
+	defaultPostgresStorageClassName = "postgres-storage-class"
 
 	// Role & binding names, used for Roles or ClusterRoles and their associated
 	// bindings.
@@ -122,6 +139,9 @@ type FeatureFlags struct {
 const (
 	// UploadConcurrencyLimitEnvVar is the environment variable for the upload concurrency limit.
 	UploadConcurrencyLimitEnvVar = "STORAGE_UPLOAD_CONCURRENCY_LIMIT"
+
+	// PutFileConcurrencyLimitEnvVar is the environment variable for the PutFile concurrency limit.
+	PutFileConcurrencyLimitEnvVar = "STORAGE_PUT_FILE_CONCURRENCY_LIMIT"
 )
 
 const (
@@ -129,11 +149,15 @@ const (
 	// (bryce) this default is set here and in the service env config, need to figure out how to refactor
 	// this to be in one place.
 	DefaultUploadConcurrencyLimit = 100
+
+	// DefaultPutFileConcurrencyLimit is the default maximum number of concurrent files that can be uploaded over GRPC or downloaded from external sources (ex. HTTP or blob storage).
+	DefaultPutFileConcurrencyLimit = 100
 )
 
 // StorageOpts are options that are applicable to the storage layer.
 type StorageOpts struct {
-	UploadConcurrencyLimit int
+	UploadConcurrencyLimit  int
+	PutFileConcurrencyLimit int
 }
 
 const (
@@ -152,22 +176,24 @@ const (
 type AssetOpts struct {
 	FeatureFlags
 	StorageOpts
-	PachdShards uint64
-	Version     string
-	LogLevel    string
-	Metrics     bool
-	Dynamic     bool
-	EtcdNodes   int
-	EtcdVolume  string
-	DashOnly    bool
-	NoDash      bool
-	DashImage   string
-	Registry    string
-	EtcdPrefix  string
-	PachdPort   int32
-	TracePort   int32
-	HTTPPort    int32
-	PeerPort    int32
+	PachdShards    uint64
+	Version        string
+	LogLevel       string
+	Metrics        bool
+	Dynamic        bool
+	EtcdNodes      int
+	EtcdVolume     string
+	PostgresNodes  int
+	PostgresVolume string
+	DashOnly       bool
+	NoDash         bool
+	DashImage      string
+	Registry       string
+	EtcdPrefix     string
+	PachdPort      int32
+	TracePort      int32
+	HTTPPort       int32
+	PeerPort       int32
 
 	// NoGuaranteed will not generate assets that have both resource limits and
 	// resource requests set which causes kubernetes to give the pods
@@ -206,6 +232,19 @@ type AssetOpts struct {
 	// creating a StatefulSet for dynamic etcd storage. If unset, a new
 	// StorageClass will be created for the StatefulSet.
 	EtcdStorageClassName string
+
+	// PostgresCPURequest is the amount of CPU (in cores) we request for each
+	// postgres node. If empty, assets.go will choose a default size.
+	PostgresCPURequest string
+
+	// PostgresMemRequest is the amount of memory we request for each postgres
+	// node. If empty, assets.go will choose a default size.
+	PostgresMemRequest string
+
+	// PostgresStorageClassName is the name of an existing StorageClass to use when
+	// creating a StatefulSet for dynamic postgres storage. If unset, a new
+	// StorageClass will be created for the StatefulSet.
+	PostgresStorageClassName string
 
 	// IAM role that the Pachyderm deployment should assume when talking to AWS
 	// services (if using kube2iam + metadata service + IAM role to delegate
@@ -286,6 +325,13 @@ func fillDefaultResourceRequests(opts *AssetOpts, persistentDiskBackend backend)
 		if opts.EtcdCPURequest == "" {
 			opts.EtcdCPURequest = "0.25"
 		}
+
+		if opts.PostgresMemRequest == "" {
+			opts.PostgresMemRequest = "256M"
+		}
+		if opts.PostgresCPURequest == "" {
+			opts.PostgresCPURequest = "0.25"
+		}
 	} else {
 		// For non-local deployments, we set the resource requirements and cache
 		// sizes higher, so that the cluster is stable and performant
@@ -305,17 +351,36 @@ func fillDefaultResourceRequests(opts *AssetOpts, persistentDiskBackend backend)
 		if opts.EtcdCPURequest == "" {
 			opts.EtcdCPURequest = "1"
 		}
+
+		if opts.PostgresMemRequest == "" {
+			opts.PostgresMemRequest = "2G"
+		}
+		if opts.PostgresCPURequest == "" {
+			opts.PostgresCPURequest = "1"
+		}
 	}
 }
 
-// ServiceAccount returns a kubernetes service account for use with Pachyderm.
-func ServiceAccount(opts *AssetOpts) *v1.ServiceAccount {
-	return &v1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ServiceAccount",
-			APIVersion: "v1",
+// ServiceAccounts returns a kubernetes service account for use with Pachyderm.
+func ServiceAccounts(opts *AssetOpts) []*v1.ServiceAccount {
+	return []*v1.ServiceAccount{
+		// Pachd service account
+		{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ServiceAccount",
+				APIVersion: "v1",
+			},
+			ObjectMeta: objectMeta(ServiceAccountName, labels(""), nil, opts.Namespace),
 		},
-		ObjectMeta: objectMeta(ServiceAccountName, labels(""), nil, opts.Namespace),
+
+		// worker service account
+		{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ServiceAccount",
+				APIVersion: "v1",
+			},
+			ObjectMeta: objectMeta(WorkerSAName, labels(""), nil, opts.Namespace),
+		},
 	}
 }
 
@@ -364,6 +429,23 @@ func Role(opts *AssetOpts) *rbacv1.Role {
 	}
 }
 
+// workerRole returns a Role bound to the Pachyderm worker service account
+// (used by workers to create an s3 gateway k8s service for each job)
+func workerRole(opts *AssetOpts) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Role",
+			APIVersion: "rbac.authorization.k8s.io/v1",
+		},
+		ObjectMeta: objectMeta(workerRoleName, labels(""), nil, opts.Namespace),
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Verbs:     []string{"get", "list", "update", "create", "delete"},
+			Resources: []string{"services"},
+		}},
+	}
+}
+
 // RoleBinding returns a RoleBinding that binds Pachyderm's Role to its
 // ServiceAccount.
 func RoleBinding(opts *AssetOpts) *rbacv1.RoleBinding {
@@ -381,6 +463,27 @@ func RoleBinding(opts *AssetOpts) *rbacv1.RoleBinding {
 		RoleRef: rbacv1.RoleRef{
 			Kind: "Role",
 			Name: roleName,
+		},
+	}
+}
+
+// RoleBinding returns a RoleBinding that binds Pachyderm's workerRole to its
+// worker service account (WorkerSAName)
+func workerRoleBinding(opts *AssetOpts) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "RoleBinding",
+			APIVersion: "rbac.authorization.k8s.io/v1",
+		},
+		ObjectMeta: objectMeta(workerRoleBindingName, labels(""), nil, opts.Namespace),
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      WorkerSAName,
+			Namespace: opts.Namespace,
+		}},
+		RoleRef: rbacv1.RoleRef{
+			Kind: "Role",
+			Name: workerRoleName,
 		},
 	}
 }
@@ -432,6 +535,7 @@ func GetSecretEnvVars(storageBackend string) []v1.EnvVar {
 func getStorageEnvVars(opts *AssetOpts) []v1.EnvVar {
 	return []v1.EnvVar{
 		{Name: UploadConcurrencyLimitEnvVar, Value: strconv.Itoa(opts.StorageOpts.UploadConcurrencyLimit)},
+		{Name: PutFileConcurrencyLimitEnvVar, Value: strconv.Itoa(opts.StorageOpts.PutFileConcurrencyLimit)},
 	}
 }
 
@@ -559,7 +663,7 @@ func PachdDeployment(opts *AssetOpts, objectStoreBackend backend, hostPath strin
 		{Name: "NO_EXPOSE_DOCKER_SOCKET", Value: strconv.FormatBool(opts.NoExposeDockerSocket)},
 		{Name: auth.DisableAuthenticationEnvVar, Value: strconv.FormatBool(opts.DisableAuthentication)},
 		{
-			Name: "PACHD_POD_NAMESPACE",
+			Name: "PACH_NAMESPACE",
 			ValueFrom: &v1.EnvVarSource{
 				FieldRef: &v1.ObjectFieldSelector{
 					APIVersion: "v1",
@@ -599,9 +703,10 @@ func PachdDeployment(opts *AssetOpts, objectStoreBackend backend, hostPath strin
 				Spec: v1.PodSpec{
 					Containers: []v1.Container{
 						{
-							Name:  pachdName,
-							Image: image,
-							Env:   envVars,
+							Name:    pachdName,
+							Image:   image,
+							Command: []string{"/pachd"},
+							Env:     envVars,
 							Ports: []v1.ContainerPort{
 								{
 									ContainerPort: opts.PachdPort, // also set in cmd/pachd/main.go
@@ -861,14 +966,31 @@ func EtcdDeployment(opts *AssetOpts, hostPath string) *apps.Deployment {
 // provisioning.  Currently dynamic volume provisioning only works
 // on AWS and GCE.
 func EtcdStorageClass(opts *AssetOpts, backend backend) (interface{}, error) {
+	return makeStorageClass(opts, backend, defaultEtcdStorageClassName, labels(etcdName))
+}
+
+// PostgresStorageClass creates a storage class used for dynamic volume
+// provisioning.  Currently dynamic volume provisioning only works
+// on AWS and GCE.
+func PostgresStorageClass(opts *AssetOpts, backend backend) (interface{}, error) {
+	return makeStorageClass(opts, backend, defaultPostgresStorageClassName, labels(postgresName))
+}
+
+func makeStorageClass(
+	opts *AssetOpts,
+	backend backend,
+	storageClassName string,
+	storageClassLabels map[string]string,
+) (interface{}, error) {
 	sc := map[string]interface{}{
 		"apiVersion": "storage.k8s.io/v1",
 		"kind":       "StorageClass",
 		"metadata": map[string]interface{}{
-			"name":      defaultEtcdStorageClassName,
-			"labels":    labels(etcdName),
+			"name":      storageClassName,
+			"labels":    storageClassLabels,
 			"namespace": opts.Namespace,
 		},
+		"allowVolumeExpansion": true,
 	}
 	switch backend {
 	case googleBackend:
@@ -890,12 +1012,30 @@ func EtcdStorageClass(opts *AssetOpts, backend backend) (interface{}, error) {
 // EtcdVolume creates a persistent volume backed by a volume with name "name"
 func EtcdVolume(persistentDiskBackend backend, opts *AssetOpts,
 	hostPath string, name string, size int) (*v1.PersistentVolume, error) {
+	return makePersistentVolume(persistentDiskBackend, opts, hostPath, name, size, etcdVolumeName, labels(etcdName))
+}
+
+// PostgresVolume creates a persistent volume backed by a volume with name "name"
+func PostgresVolume(persistentDiskBackend backend, opts *AssetOpts,
+	hostPath string, name string, size int) (*v1.PersistentVolume, error) {
+	return makePersistentVolume(persistentDiskBackend, opts, hostPath, name, size, postgresVolumeName, labels(postgresName))
+}
+
+func makePersistentVolume(
+	persistentDiskBackend backend,
+	opts *AssetOpts,
+	hostPath string,
+	name string,
+	size int,
+	volumeName string,
+	volumeLabels map[string]string,
+) (*v1.PersistentVolume, error) {
 	spec := &v1.PersistentVolume{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "PersistentVolume",
 			APIVersion: "v1",
 		},
-		ObjectMeta: objectMeta(etcdVolumeName, labels(etcdName), nil, opts.Namespace),
+		ObjectMeta: objectMeta(volumeName, volumeLabels, nil, opts.Namespace),
 		Spec: v1.PersistentVolumeSpec{
 			Capacity: map[v1.ResourceName]resource.Quantity{
 				"storage": resource.MustParse(fmt.Sprintf("%vGi", size)),
@@ -937,12 +1077,12 @@ func EtcdVolume(persistentDiskBackend backend, opts *AssetOpts,
 		pathType := v1.HostPathDirectoryOrCreate
 		spec.Spec.PersistentVolumeSource = v1.PersistentVolumeSource{
 			HostPath: &v1.HostPathVolumeSource{
-				Path: path.Join(hostPath, "etcd"),
+				Path: path.Join(hostPath, volumeName),
 				Type: &pathType,
 			},
 		}
 	default:
-		return nil, fmt.Errorf("cannot generate volume spec for unknown backend \"%v\"", persistentDiskBackend)
+		return nil, errors.Errorf("cannot generate volume spec for unknown backend \"%v\"", persistentDiskBackend)
 	}
 	return spec, nil
 }
@@ -952,12 +1092,30 @@ func EtcdVolume(persistentDiskBackend backend, opts *AssetOpts,
 // Note that if you're controlling Etcd with a Stateful Set, this is
 // unnecessary (the stateful set controller will create PVCs automatically).
 func EtcdVolumeClaim(size int, opts *AssetOpts) *v1.PersistentVolumeClaim {
+	return makeVolumeClaim(size, opts, etcdVolumeName, etcdVolumeClaimName, labels(etcdName))
+}
+
+// PostgresVolumeClaim creates a persistent volume claim of 'size' GB.
+//
+// Note that if you're controlling Postgres with a Stateful Set, this is
+// unnecessary (the stateful set controller will create PVCs automatically).
+func PostgresVolumeClaim(size int, opts *AssetOpts) *v1.PersistentVolumeClaim {
+	return makeVolumeClaim(size, opts, postgresVolumeName, postgresVolumeClaimName, labels(postgresName))
+}
+
+func makeVolumeClaim(
+	size int,
+	opts *AssetOpts,
+	volumeName string,
+	volumeClaimName string,
+	volumeClaimLabels map[string]string,
+) *v1.PersistentVolumeClaim {
 	return &v1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "PersistentVolumeClaim",
 			APIVersion: "v1",
 		},
-		ObjectMeta: objectMeta(etcdVolumeClaimName, labels(etcdName), nil, opts.Namespace),
+		ObjectMeta: objectMeta(volumeClaimName, volumeClaimLabels, nil, opts.Namespace),
 		Spec: v1.PersistentVolumeClaimSpec{
 			Resources: v1.ResourceRequirements{
 				Requests: map[v1.ResourceName]resource.Quantity{
@@ -965,7 +1123,7 @@ func EtcdVolumeClaim(size int, opts *AssetOpts) *v1.PersistentVolumeClaim {
 				},
 			},
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
-			VolumeName:  etcdVolumeName,
+			VolumeName:  volumeName,
 		},
 	}
 }
@@ -1258,6 +1416,126 @@ func DashService(opts *AssetOpts) *v1.Service {
 	}
 }
 
+// PostgresDeployment generates a Deployment for the pachyderm postgres instance.
+func PostgresDeployment(opts *AssetOpts, hostPath string) *apps.Deployment {
+	cpu := resource.MustParse(opts.PostgresCPURequest)
+	mem := resource.MustParse(opts.PostgresMemRequest)
+	var volumes []v1.Volume
+	if hostPath == "" {
+		volumes = []v1.Volume{
+			{
+				Name: "postgres-storage",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: postgresVolumeClaimName,
+					},
+				},
+			},
+		}
+	} else {
+		volumes = []v1.Volume{
+			{
+				Name: "postgres-storage",
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Path: filepath.Join(hostPath, "postgres"),
+					},
+				},
+			},
+		}
+	}
+	resourceRequirements := v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    cpu,
+			v1.ResourceMemory: mem,
+		},
+	}
+	if !opts.NoGuaranteed {
+		resourceRequirements.Limits = v1.ResourceList{
+			v1.ResourceCPU:    cpu,
+			v1.ResourceMemory: mem,
+		}
+	}
+	image := postgresImage
+	if opts.Registry != "" {
+		image = AddRegistry(opts.Registry, postgresImage)
+	}
+	return &apps.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Deployment",
+			APIVersion: "apps/v1beta1",
+		},
+		ObjectMeta: objectMeta(postgresName, labels(postgresName), nil, opts.Namespace),
+		Spec: apps.DeploymentSpec{
+			Replicas: replicas(1),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels(postgresName),
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: objectMeta(postgresName, labels(postgresName), nil, opts.Namespace),
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name:  postgresName,
+							Image: image,
+							//TODO figure out how to get a cluster of these to talk to each other
+							Ports: []v1.ContainerPort{
+								{
+									ContainerPort: 5432,
+									Name:          "client-port",
+								},
+							},
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name:      "postgres-storage",
+									MountPath: "/var/lib/postgresql/data",
+								},
+							},
+							ImagePullPolicy: "IfNotPresent",
+							Resources:       resourceRequirements,
+							Env: []v1.EnvVar{
+								{Name: "POSTGRES_DB", Value: "pgc"},
+								{Name: "POSTGRES_USER", Value: "pachyderm"},
+								{Name: "POSTGRES_PASSWORD", Value: "elephantastic"},
+							},
+						},
+					},
+					Volumes:          volumes,
+					ImagePullSecrets: imagePullSecrets(opts),
+				},
+			},
+		},
+	}
+}
+
+// PostgresService generates a Service for the pachyderm postgres instance.
+func PostgresService(local bool, opts *AssetOpts) *v1.Service {
+	var clientNodePort int32
+	if local {
+		clientNodePort = 32228
+	}
+	return &v1.Service{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Service",
+			APIVersion: "v1",
+		},
+		ObjectMeta: objectMeta(postgresName, labels(postgresName), nil, opts.Namespace),
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeNodePort,
+			Selector: map[string]string{
+				"app": postgresName,
+			},
+			Ports: []v1.ServicePort{
+				{
+					Port:     5432,
+					Name:     "client-port",
+					NodePort: clientNodePort,
+				},
+			},
+		},
+	}
+}
+
 // MinioSecret creates an amazon secret with the following parameters:
 //   bucket - S3 bucket name
 //   id     - S3 access key id
@@ -1401,7 +1679,7 @@ func WriteAssets(encoder serde.Encoder, opts *AssetOpts, objectStoreBackend back
 	// If either backend is "local", both must be "local"
 	if (persistentDiskBackend == localBackend || objectStoreBackend == localBackend) &&
 		persistentDiskBackend != objectStoreBackend {
-		return fmt.Errorf("if either persistentDiskBackend or objectStoreBackend "+
+		return errors.Errorf("if either persistentDiskBackend or objectStoreBackend "+
 			"is \"local\", both must be \"local\", but persistentDiskBackend==%d, \n"+
 			"and objectStoreBackend==%d", persistentDiskBackend, objectStoreBackend)
 	}
@@ -1413,8 +1691,10 @@ func WriteAssets(encoder serde.Encoder, opts *AssetOpts, objectStoreBackend back
 		return nil
 	}
 
-	if err := encoder.Encode(ServiceAccount(opts)); err != nil {
-		return err
+	for _, sa := range ServiceAccounts(opts) {
+		if err := encoder.Encode(sa); err != nil {
+			return err
+		}
 	}
 	if !opts.NoRBAC {
 		if opts.LocalRoles {
@@ -1432,14 +1712,20 @@ func WriteAssets(encoder serde.Encoder, opts *AssetOpts, objectStoreBackend back
 				return err
 			}
 		}
+		if err := encoder.Encode(workerRole(opts)); err != nil {
+			return err
+		}
+		if err := encoder.Encode(workerRoleBinding(opts)); err != nil {
+			return err
+		}
 	}
 
 	if opts.EtcdNodes > 0 && opts.EtcdVolume != "" {
-		return fmt.Errorf("only one of --dynamic-etcd-nodes and --static-etcd-volume should be given, but not both")
+		return errors.Errorf("only one of --dynamic-etcd-nodes and --static-etcd-volume should be given, but not both")
 	}
 
 	// In the dynamic route, we create a storage class which dynamically
-	// provisions volumes, and run etcd as a statful set.
+	// provisions volumes, and run etcd as a stateful set.
 	// In the static route, we create a single volume, a single volume
 	// claim, and run etcd as a replication controller with a single node.
 	if objectStoreBackend == localBackend {
@@ -1480,10 +1766,62 @@ func WriteAssets(encoder serde.Encoder, opts *AssetOpts, objectStoreBackend back
 			return err
 		}
 	} else {
-		return fmt.Errorf("unless deploying locally, either --dynamic-etcd-nodes or --static-etcd-volume needs to be provided")
+		return errors.Errorf("unless deploying locally, either --dynamic-etcd-nodes or --static-etcd-volume needs to be provided")
 	}
 	if err := encoder.Encode(EtcdNodePortService(objectStoreBackend == localBackend, opts)); err != nil {
 		return err
+	}
+
+	if opts.NewStorageLayer {
+		// In the dynamic route, we create a storage class which dynamically
+		// provisions volumes, and run postgres as a stateful set.
+		// In the static route, we create a single volume, a single volume
+		// claim, and run etcd as a replication controller with a single node.
+		if objectStoreBackend == localBackend {
+			if err := encoder.Encode(PostgresDeployment(opts, hostPath)); err != nil {
+				return err
+			}
+		} else if opts.PostgresNodes > 0 {
+			// Create a StorageClass, if the user didn't provide one.
+			if opts.PostgresStorageClassName == "" {
+				sc, err := PostgresStorageClass(opts, persistentDiskBackend)
+				if err != nil {
+					return err
+				}
+				if sc != nil {
+					if err = encoder.Encode(sc); err != nil {
+						return err
+					}
+				}
+			}
+			// TODO: is this necessary?
+			// if err := encoder.Encode(PostgresHeadlessService(opts)); err != nil {
+			// 	return err
+			// }
+			// TODO: add stateful set
+			// if err := encoder.Encode(PostgresStatefulSet(opts, persistentDiskBackend, volumeSize)); err != nil {
+			// 	return err
+			// }
+		} else if opts.PostgresVolume != "" || persistentDiskBackend == localBackend {
+			volume, err := PostgresVolume(persistentDiskBackend, opts, hostPath, opts.PostgresVolume, volumeSize)
+			if err != nil {
+				return err
+			}
+			if err = encoder.Encode(volume); err != nil {
+				return err
+			}
+			if err = encoder.Encode(PostgresVolumeClaim(volumeSize, opts)); err != nil {
+				return err
+			}
+			if err = encoder.Encode(PostgresDeployment(opts, "")); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("unless deploying locally, either --dynamic-etcd-nodes or --static-etcd-volume needs to be provided")
+		}
+		if err := encoder.Encode(PostgresService(objectStoreBackend == localBackend, opts)); err != nil {
+			return err
+		}
 	}
 
 	if err := encoder.Encode(PachdService(opts)); err != nil {
@@ -1518,24 +1856,24 @@ func WriteTLSSecret(encoder serde.Encoder, opts *AssetOpts) error {
 		return nil
 	}
 	if opts.TLS == nil {
-		return fmt.Errorf("internal error: WriteTLSSecret called but opts.TLS is nil")
+		return errors.Errorf("internal error: WriteTLSSecret called but opts.TLS is nil")
 	}
 	if opts.TLS.ServerKey == "" {
-		return fmt.Errorf("internal error: WriteTLSSecret called but opts.TLS.ServerKey is \"\"")
+		return errors.Errorf("internal error: WriteTLSSecret called but opts.TLS.ServerKey is \"\"")
 	}
 	if opts.TLS.ServerCert == "" {
-		return fmt.Errorf("internal error: WriteTLSSecret called but opts.TLS.ServerCert is \"\"")
+		return errors.Errorf("internal error: WriteTLSSecret called but opts.TLS.ServerCert is \"\"")
 	}
 
 	// Attempt to copy server cert and key files into config (kubernetes client
 	// does the base64-encoding)
 	certBytes, err := ioutil.ReadFile(opts.TLS.ServerCert)
 	if err != nil {
-		return fmt.Errorf("could not open server cert at \"%s\": %v", opts.TLS.ServerCert, err)
+		return errors.Wrapf(err, "could not open server cert at \"%s\"", opts.TLS.ServerCert)
 	}
 	keyBytes, err := ioutil.ReadFile(opts.TLS.ServerKey)
 	if err != nil {
-		return fmt.Errorf("could not open server key at \"%s\": %v", opts.TLS.ServerKey, err)
+		return errors.Wrapf(err, "could not open server key at \"%s\"", opts.TLS.ServerKey)
 	}
 	secret := &v1.Secret{
 		TypeMeta: metav1.TypeMeta{
@@ -1568,11 +1906,11 @@ func WriteCustomAssets(encoder serde.Encoder, opts *AssetOpts, args []string, ob
 	switch objectStoreBackend {
 	case "s3":
 		if len(args) != s3CustomArgs {
-			return fmt.Errorf("expected %d arguments for disk+s3 backend", s3CustomArgs)
+			return errors.Errorf("expected %d arguments for disk+s3 backend", s3CustomArgs)
 		}
 		volumeSize, err := strconv.Atoi(args[1])
 		if err != nil {
-			return fmt.Errorf("volume size needs to be an integer; instead got %v", args[1])
+			return errors.Errorf("volume size needs to be an integer; instead got %v", args[1])
 		}
 		objectStoreBackend := amazonBackend
 		// (bryce) use minio if we need v2 signing enabled.
@@ -1593,7 +1931,7 @@ func WriteCustomAssets(encoder serde.Encoder, opts *AssetOpts, args []string, ob
 				return err
 			}
 		default:
-			return fmt.Errorf("did not recognize the choice of persistent-disk")
+			return errors.Errorf("did not recognize the choice of persistent-disk")
 		}
 		bucket := args[2]
 		id := args[3]
@@ -1605,7 +1943,7 @@ func WriteCustomAssets(encoder serde.Encoder, opts *AssetOpts, args []string, ob
 		// (bryce) hardcode region?
 		return WriteSecret(encoder, AmazonSecret("us-east-1", bucket, id, secret, "", "", endpoint, advancedConfig), opts)
 	default:
-		return fmt.Errorf("did not recognize the choice of object-store")
+		return errors.Errorf("did not recognize the choice of object-store")
 	}
 }
 
@@ -1661,6 +1999,7 @@ func Images(opts *AssetOpts) []string {
 	return []string{
 		versionedWorkerImage(opts),
 		etcdImage,
+		postgresImage,
 		grpcProxyImage,
 		pauseImage,
 		versionedPachdImage(opts),

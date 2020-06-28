@@ -29,8 +29,6 @@ const (
 	// PPSPipelineNameEnv is the env var that sets the name of the pipeline
 	// that the workers are running.
 	PPSPipelineNameEnv = "PPS_PIPELINE_NAME"
-	// PPSNamespaceEnv is the namespace in which pachyderm is deployed
-	PPSNamespaceEnv = "PPS_NAMESPACE"
 	// PPSJobIDEnv is the env var that sets the ID of the job that the
 	// workers are running (if the workers belong to an orphan job, rather than a
 	// pipeline).
@@ -205,13 +203,16 @@ func (c APIClient) CreateJob(pipeline string, outputCommit, statsCommit *pfs.Com
 
 // InspectJob returns info about a specific job.
 // blockState will cause the call to block until the job reaches a terminal state (failure or success).
-func (c APIClient) InspectJob(jobID string, blockState bool) (*pps.JobInfo, error) {
-	jobInfo, err := c.PpsAPIClient.InspectJob(
-		c.Ctx(),
-		&pps.InspectJobRequest{
-			Job:        NewJob(jobID),
-			BlockState: blockState,
-		})
+// full indicates that the full job info should be returned.
+func (c APIClient) InspectJob(jobID string, blockState bool, full ...bool) (*pps.JobInfo, error) {
+	req := &pps.InspectJobRequest{
+		Job:        NewJob(jobID),
+		BlockState: blockState,
+	}
+	if len(full) > 0 {
+		req.Full = full[0]
+	}
+	jobInfo, err := c.PpsAPIClient.InspectJob(c.Ctx(), req)
 	return jobInfo, grpcutil.ScrubGRPC(err)
 }
 
@@ -746,6 +747,9 @@ func (c APIClient) CreatePipelineService(
 		c.Ctx(),
 		&pps.CreatePipelineRequest{
 			Pipeline: NewPipeline(name),
+			Metadata: &pps.Metadata{
+				Annotations: annotations,
+			},
 			Transform: &pps.Transform{
 				Image: image,
 				Cmd:   cmd,
@@ -757,7 +761,6 @@ func (c APIClient) CreatePipelineService(
 			Service: &pps.Service{
 				InternalPort: internalPort,
 				ExternalPort: externalPort,
-				Annotations:  annotations,
 			},
 		},
 	)

@@ -2,16 +2,13 @@ package fileset
 
 import (
 	"context"
-	"math"
+	"io"
 
 	"github.com/pachyderm/pachyderm/src/server/pkg/obj"
 	"github.com/pachyderm/pachyderm/src/server/pkg/storage/chunk"
 	"github.com/pachyderm/pachyderm/src/server/pkg/storage/fileset/index"
 	"github.com/pachyderm/pachyderm/src/server/pkg/storage/fileset/tar"
-)
-
-var (
-	averageBits = 23
+	"github.com/pachyderm/pachyderm/src/server/pkg/uuid"
 )
 
 type data struct {
@@ -21,21 +18,28 @@ type data struct {
 // Writer writes the serialized format of a fileset.
 // The serialized format of a fileset consists of indexes and content.
 type Writer struct {
-	ctx     context.Context
-	tw      *tar.Writer
-	cw      *chunk.Writer
-	iw      *index.Writer
-	lastIdx *index.Index
-	first   bool
+	ctx       context.Context
+	tw        *tar.Writer
+	cw        *chunk.Writer
+	iw        *index.Writer
+	idx       *index.Index
+	indexFunc func(*index.Index) error
+	lastIdx   *index.Index
+	priorFile bool
 }
 
-func newWriter(ctx context.Context, objC obj.Client, chunks *chunk.Storage, path string) *Writer {
-	w := &Writer{
-		ctx:   ctx,
-		iw:    index.NewWriter(ctx, objC, chunks, path),
-		first: true,
+func newWriter(ctx context.Context, objC obj.Client, chunks *chunk.Storage, path string, opts ...WriterOption) *Writer {
+	tmpID := path + uuid.NewWithoutDashes()
+	w := &Writer{ctx: ctx}
+	for _, opt := range opts {
+		opt(w)
 	}
-	cw := chunks.NewWriter(ctx, averageBits, math.MaxInt64, w.callback())
+	var chunkWriterOpts []chunk.WriterOption
+	if w.indexFunc != nil {
+		chunkWriterOpts = append(chunkWriterOpts, chunk.WithNoUpload())
+	}
+	w.iw = index.NewWriter(ctx, objC, chunks, path, tmpID)
+	cw := chunks.NewWriter(ctx, tmpID, w.callback(), chunkWriterOpts...)
 	w.cw = cw
 	w.tw = tar.NewWriter(cw)
 	return w
@@ -44,9 +48,10 @@ func newWriter(ctx context.Context, objC obj.Client, chunks *chunk.Storage, path
 // WriteHeader writes a tar header and prepares to accept the file's contents.
 func (w *Writer) WriteHeader(hdr *tar.Header) error {
 	// Finish prior file.
-	if err := w.finishFile(); err != nil {
+	if err := w.finishPriorFile(); err != nil {
 		return err
 	}
+	w.priorFile = true
 	// Setup annotation in chunk writer.
 	w.setupAnnotation(hdr.Name)
 	// Setup header tag for the file.
@@ -55,26 +60,30 @@ func (w *Writer) WriteHeader(hdr *tar.Header) error {
 	return w.tw.WriteHeader(hdr)
 }
 
-func (w *Writer) finishFile() error {
-	if w.first {
-		w.first = false
+func (w *Writer) finishPriorFile() error {
+	if !w.priorFile {
 		return nil
 	}
+	w.priorFile = false
 	w.cw.Tag(paddingTag)
-	// Flush the last file's content.
+	// Flush the prior file's content.
 	return w.tw.Flush()
 }
 
-func (w *Writer) setupAnnotation(path string) {
-	w.cw.Annotate(&chunk.Annotation{
-		NextDataRef: &chunk.DataRef{},
+func (w *Writer) setupAnnotation(path string, empty ...bool) {
+	w.idx = &index.Index{
+		Path:   path,
+		DataOp: &index.DataOp{},
+	}
+	a := &chunk.Annotation{
 		Data: &data{
-			idx: &index.Index{
-				Path:   path,
-				DataOp: &index.DataOp{},
-			},
+			idx: w.idx,
 		},
-	})
+	}
+	if len(empty) > 0 {
+		a.Empty = empty[0]
+	}
+	w.cw.Annotate(a)
 }
 
 func (w *Writer) callback() chunk.WriterFunc {
@@ -92,16 +101,26 @@ func (w *Writer) callback() chunk.WriterFunc {
 		// Update the file indexes.
 		for i := 0; i < len(annotations); i++ {
 			idx := annotations[i].Data.(*data).idx
-			idx.DataOp.DataRefs = append(idx.DataOp.DataRefs, annotations[i].NextDataRef)
-			for _, tag := range annotations[i].NextDataRef.Tags {
-				if tag.Id != headerTag && tag.Id != paddingTag {
-					idx.SizeBytes += int64(tag.SizeBytes)
+			if annotations[i].NextDataRef != nil {
+				idx.DataOp.DataRefs = append(idx.DataOp.DataRefs, annotations[i].NextDataRef)
+				for _, tag := range annotations[i].NextDataRef.Tags {
+					if tag.Id != headerTag && tag.Id != paddingTag {
+						idx.SizeBytes += int64(tag.SizeBytes)
+					}
 				}
 			}
 			idxs = append(idxs, idx)
 		}
 		// Don't write out the last file index (it may have more content in the next chunk).
 		idxs = idxs[:len(idxs)-1]
+		if w.indexFunc != nil {
+			for _, idx := range idxs {
+				if err := w.indexFunc(idx); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		return w.iw.WriteIndexes(idxs)
 	}
 }
@@ -116,13 +135,43 @@ func (w *Writer) Write(data []byte) (int, error) {
 	return w.tw.Write(data)
 }
 
+// DeleteFile deletes a file.
+// The optional tag field indicates specific tags in the files to delete.
+func (w *Writer) DeleteFile(name string, tags ...string) error {
+	if len(tags) == 0 {
+		tags = []string{headerTag}
+	}
+	// Finish prior file.
+	if err := w.finishPriorFile(); err != nil {
+		return err
+	}
+	w.setupAnnotation(name, true)
+	for _, tag := range tags {
+		w.DeleteTag(tag)
+	}
+	return nil
+}
+
+// DeleteTag deletes a tag in the current file.
+func (w *Writer) DeleteTag(id string) {
+	// TODO Might want this to be a map, then convert to slice.
+	w.idx.DataOp.DeleteTags = append(w.idx.DataOp.DeleteTags, &chunk.Tag{Id: id})
+}
+
 // CopyFile copies a file (header and tags included).
 func (w *Writer) CopyFile(fr *FileReader) error {
 	// Finish prior file.
-	if err := w.finishFile(); err != nil {
+	if err := w.finishPriorFile(); err != nil {
 		return err
 	}
-	w.setupAnnotation(fr.Index().Path)
+	var empty bool
+	if _, err := fr.PeekTag(); err == io.EOF {
+		empty = true
+	}
+	w.setupAnnotation(fr.Index().Path, empty)
+	for _, tag := range fr.Index().DataOp.DeleteTags {
+		w.DeleteTag(tag.Id)
+	}
 	return fr.Iterate(func(dr *chunk.DataReader) error {
 		return w.cw.Copy(dr)
 	})
@@ -139,7 +188,7 @@ func (w *Writer) CopyTags(dr *chunk.DataReader) error {
 // Close closes the writer.
 func (w *Writer) Close() error {
 	// Finish prior file.
-	if err := w.finishFile(); err != nil {
+	if err := w.finishPriorFile(); err != nil {
 		return err
 	}
 	// Close the chunk writer.
@@ -148,9 +197,16 @@ func (w *Writer) Close() error {
 	}
 	// Write out the last index.
 	if w.lastIdx != nil {
-		if err := w.iw.WriteIndexes([]*index.Index{w.lastIdx}); err != nil {
+		if w.indexFunc != nil {
+			if err := w.indexFunc(w.lastIdx); err != nil {
+				return err
+			}
+		} else if err := w.iw.WriteIndexes([]*index.Index{w.lastIdx}); err != nil {
 			return err
 		}
+	}
+	if w.indexFunc != nil {
+		return nil
 	}
 	// Close the index writer.
 	return w.iw.Close()

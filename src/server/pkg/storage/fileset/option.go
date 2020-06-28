@@ -1,6 +1,10 @@
 package fileset
 
-import "github.com/pachyderm/pachyderm/src/server/pkg/serviceenv"
+import (
+	"github.com/pachyderm/pachyderm/src/server/pkg/serviceenv"
+	"github.com/pachyderm/pachyderm/src/server/pkg/storage/fileset/index"
+	"golang.org/x/sync/semaphore"
+)
 
 // StorageOption configures a storage.
 type StorageOption func(s *Storage)
@@ -37,6 +41,14 @@ func WithLevelSizeBase(base int) StorageOption {
 	}
 }
 
+// WithMaxOpenFileSets sets the maximum number of filesets that will be open
+// (potentially buffered in memory) at a time.
+func WithMaxOpenFileSets(max int) StorageOption {
+	return func(s *Storage) {
+		s.filesetSem = semaphore.NewWeighted(int64(max))
+	}
+}
+
 // Option configures a file set.
 type Option func(f *FileSet)
 
@@ -44,6 +56,16 @@ type Option func(f *FileSet)
 func WithRoot(root string) Option {
 	return func(f *FileSet) {
 		f.root = root
+	}
+}
+
+// WriterOption configures a file set writer.
+type WriterOption func(w *Writer)
+
+// WithNoUpload sets the writer to no upload (will not upload chunks).
+func WithNoUpload(f func(*index.Index) error) WriterOption {
+	return func(w *Writer) {
+		w.indexFunc = f
 	}
 }
 

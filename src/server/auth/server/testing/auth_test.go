@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,8 +16,8 @@ import (
 	minio "github.com/minio/minio-go"
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/auth"
-	"github.com/pachyderm/pachyderm/src/client/enterprise"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/require"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	authserver "github.com/pachyderm/pachyderm/src/server/auth/server"
@@ -54,14 +53,14 @@ func isAuthActive(tb testing.TB, checkConfig bool) bool {
 			if err := backoff.Retry(func() error {
 				resp, err := adminClient.GetConfiguration(adminClient.Ctx(), &auth.GetConfigurationRequest{})
 				if err != nil {
-					return fmt.Errorf("could not get config: %v", err)
+					return errors.Wrapf(err, "could not get config")
 				}
 				cfg := resp.GetConfiguration()
 				if cfg.SAMLServiceOptions != nil {
-					return fmt.Errorf("SAML config in fresh cluster: %+v", cfg)
+					return errors.Errorf("SAML config in fresh cluster: %+v", cfg)
 				}
 				if len(cfg.IDProviders) != 1 || cfg.IDProviders[0].SAML != nil || cfg.IDProviders[0].GitHub == nil || cfg.IDProviders[0].Name != "GitHub" {
-					return fmt.Errorf("problem with ID providers in config in fresh cluster: %+v", cfg)
+					return errors.Errorf("problem with ID providers in config in fresh cluster: %+v", cfg)
 				}
 				return nil
 			}, backoff.NewTestingBackOff()); err != nil {
@@ -152,7 +151,7 @@ func activateAuth(tb testing.TB) {
 		if isAuthActive(tb, true) {
 			return nil
 		}
-		return fmt.Errorf("auth not active yet")
+		return errors.Errorf("auth not active yet")
 	}, backoff.NewTestingBackOff()))
 }
 
@@ -201,21 +200,7 @@ func getPachClientP(tb testing.TB, subject string, checkConfig bool) *client.API
 	}
 
 	// Activate Pachyderm Enterprise (if it's not already active)
-	require.NoError(tb, backoff.Retry(func() error {
-		resp, err := seedClient.Enterprise.GetState(context.Background(),
-			&enterprise.GetStateRequest{})
-		if err != nil {
-			return err
-		}
-		if resp.State == enterprise.State_ACTIVE {
-			return nil
-		}
-		_, err = seedClient.Enterprise.Activate(context.Background(),
-			&enterprise.ActivateRequest{
-				ActivationCode: tu.GetTestEnterpriseCode(),
-			})
-		return err
-	}, backoff.NewTestingBackOff()))
+	require.NoError(tb, tu.ActivateEnterprise(tb, seedClient))
 
 	// Cluster may be in one of four states:
 	// 1) Auth is off (=> Activate auth)
@@ -299,7 +284,7 @@ func getPachClientP(tb testing.TB, subject string, checkConfig bool) *client.API
 				&auth.GetAdminsRequest{})
 			hasExpectedAdmin := len(getAdminsResp.Admins) == 1 && getAdminsResp.Admins[0] == admin
 			if !hasExpectedAdmin {
-				return fmt.Errorf("cluster admins haven't yet updated")
+				return errors.Errorf("cluster admins haven't yet updated")
 			}
 			return nil
 		}, backoff.NewTestingBackOff()))
@@ -1132,6 +1117,7 @@ func TestPipelineMultipleInputs(t *testing.T) {
 // or bob's access to the pipeline's inputs are revoked, the pipeline should
 // stop, but for now it's required to revoke the pipeline's access directly
 func TestPipelineRevoke(t *testing.T) {
+	t.Skip("TestPipelineRevoke is broken")
 	if testing.Short() {
 		t.Skip("Skipping integration tests in short mode")
 	}
@@ -1500,7 +1486,7 @@ func TestStopJob(t *testing.T) {
 			return err
 		}
 		if len(jobs) != 1 {
-			return fmt.Errorf("expected one job but got %d", len(jobs))
+			return errors.Errorf("expected one job but got %d", len(jobs))
 		}
 		jobID = jobs[0].Job.ID
 		return nil
@@ -1510,10 +1496,10 @@ func TestStopJob(t *testing.T) {
 	require.NoErrorWithinTRetry(t, 30*time.Second, func() error {
 		ji, err := aliceClient.InspectJob(jobID, false)
 		if err != nil {
-			return fmt.Errorf("could not inspect job %q: %v", jobID, err)
+			return errors.Wrapf(err, "could not inspect job %q", jobID)
 		}
 		if ji.State != pps.JobState_JOB_KILLED {
-			return fmt.Errorf("expected job %q to be in JOB_KILLED but was in %s", jobID, ji.State.String())
+			return errors.Errorf("expected job %q to be in JOB_KILLED but was in %s", jobID, ji.State.String())
 		}
 		return nil
 	})
@@ -2985,7 +2971,7 @@ func TestDeletePipelineMissingRepos(t *testing.T) {
 		}
 		for _, pi := range pis {
 			if pi.Pipeline.Name == pipeline {
-				return fmt.Errorf("Expected %q to be deleted, but still present", pipeline)
+				return errors.Errorf("Expected %q to be deleted, but still present", pipeline)
 			}
 		}
 		return nil

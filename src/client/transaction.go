@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/pachyderm/pachyderm/src/client/admin"
 	"github.com/pachyderm/pachyderm/src/client/auth"
@@ -15,6 +14,7 @@ import (
 	"github.com/pachyderm/pachyderm/src/client/version/versionpb"
 
 	types "github.com/gogo/protobuf/types"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -41,14 +41,14 @@ func (c APIClient) WithTransaction(txn *transaction.Transaction) *APIClient {
 func GetTransaction(ctx context.Context) (*transaction.Transaction, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return nil, fmt.Errorf("request metadata could not be parsed from context")
+		return nil, errors.Errorf("request metadata could not be parsed from context")
 	}
 
 	txns := md.Get(transactionMetadataKey)
 	if len(txns) == 0 {
 		return nil, nil
 	} else if len(txns) > 1 {
-		return nil, fmt.Errorf("multiple active transactions found in context")
+		return nil, errors.Errorf("multiple active transactions found in context")
 	}
 	return &transaction.Transaction{ID: txns[0]}, nil
 }
@@ -254,7 +254,7 @@ func newTransactionBuilder(parent *APIClient) *TransactionBuilder {
 // ownership of a connection to the API server. We need this to shadow the
 // inherited Close, though.
 func (tb *TransactionBuilder) Close() error {
-	return fmt.Errorf("Close is not implemented on a TransactionBuilder instance")
+	return errors.Errorf("Close is not implemented on a TransactionBuilder instance")
 }
 
 // GetAddress should not exist on a TransactionBuilder because it doesn't represent
@@ -314,7 +314,7 @@ func (c *ppsBuilderClient) UpdateJobState(ctx context.Context, req *pps.UpdateJo
 
 // Boilerplate for making unsupported API requests error when used on a TransactionBuilder
 func unsupportedError(name string) error {
-	return fmt.Errorf("the '%s' API call is not supported in transactions", name)
+	return errors.Errorf("the '%s' API call is not supported in transactions", name)
 }
 
 func (c *pfsBuilderClient) InspectRepo(ctx context.Context, req *pfs.InspectRepoRequest, opts ...grpc.CallOption) (*pfs.RepoInfo, error) {
@@ -386,11 +386,20 @@ func (c *pfsBuilderClient) DeleteAll(ctx context.Context, req *types.Empty, opts
 func (c *pfsBuilderClient) Fsck(ctx context.Context, req *pfs.FsckRequest, opts ...grpc.CallOption) (pfs.API_FsckClient, error) {
 	return nil, unsupportedError("Fsck")
 }
-func (c *pfsBuilderClient) PutTar(ctx context.Context, opts ...grpc.CallOption) (pfs.API_PutTarClient, error) {
-	return nil, unsupportedError("PutTar")
+func (c *pfsBuilderClient) FileOperationV2(ctx context.Context, opts ...grpc.CallOption) (pfs.API_FileOperationV2Client, error) {
+	return nil, unsupportedError("FileOperationV2")
 }
-func (c *pfsBuilderClient) GetTar(ctx context.Context, req *pfs.GetTarRequest, opts ...grpc.CallOption) (pfs.API_GetTarClient, error) {
-	return nil, unsupportedError("GetTar")
+func (c *pfsBuilderClient) GetTarV2(ctx context.Context, req *pfs.GetTarRequestV2, opts ...grpc.CallOption) (pfs.API_GetTarV2Client, error) {
+	return nil, unsupportedError("GetTarV2")
+}
+func (c *pfsBuilderClient) GetTarConditionalV2(ctx context.Context, opts ...grpc.CallOption) (pfs.API_GetTarConditionalV2Client, error) {
+	return nil, unsupportedError("GetTarConditionalV2")
+}
+func (c *pfsBuilderClient) ListFileV2(ctx context.Context, req *pfs.ListFileRequest, opts ...grpc.CallOption) (pfs.API_ListFileV2Client, error) {
+	return nil, unsupportedError("ListFileV2")
+}
+func (c *pfsBuilderClient) GlobFileV2(ctx context.Context, req *pfs.GlobFileRequest, opts ...grpc.CallOption) (pfs.API_GlobFileV2Client, error) {
+	return nil, unsupportedError("GlobFileV2")
 }
 
 func (c *objectBuilderClient) PutObject(ctx context.Context, opts ...grpc.CallOption) (pfs.ObjectAPI_PutObjectClient, error) {
@@ -452,6 +461,12 @@ func (c *objectBuilderClient) DeleteTags(ctx context.Context, req *pfs.DeleteTag
 }
 func (c *objectBuilderClient) Compact(ctx context.Context, req *types.Empty, opts ...grpc.CallOption) (*types.Empty, error) {
 	return nil, unsupportedError("Compact")
+}
+func (c *objectBuilderClient) PutObjDirect(ctx context.Context, opts ...grpc.CallOption) (pfs.ObjectAPI_PutObjDirectClient, error) {
+	return nil, unsupportedError("PutObj")
+}
+func (c *objectBuilderClient) GetObjDirect(ctx context.Context, req *pfs.GetObjDirectRequest, opts ...grpc.CallOption) (pfs.ObjectAPI_GetObjDirectClient, error) {
+	return nil, unsupportedError("GetObj")
 }
 
 func (c *ppsBuilderClient) CreateJob(ctx context.Context, req *pps.CreateJobRequest, opts ...grpc.CallOption) (*pps.Job, error) {

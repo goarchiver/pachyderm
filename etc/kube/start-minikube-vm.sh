@@ -2,10 +2,10 @@
 
 set -e
 
-cd ${GOPATH}/src/github.com/pachyderm/pachyderm
+cd "$(git rev-parse --show-toplevel)"
 
 function die {
-  echo "error: $1" >2
+  echo "error: $1" >&2
   exit 1
 }
 export -f die
@@ -16,10 +16,10 @@ function get_images {
     make install || die "could not build pachctl"
     make docker-build || die "could not build pachd/worker"
   else
-    for i in pachd worker; do
-      echo docker pull pachyderm/${i}:${PACH_VERSION}
-      docker pull pachyderm/${i}:${PACH_VERSION}
-    done
+    echo docker pull "pachyderm/pachd:${PACH_VERSION}"
+    docker pull "pachyderm/pachd:${PACH_VERSION}"
+    echo docker pull "pachyderm/worker:${PACH_VERSION}"
+    docker pull "pachyderm/worker:${PACH_VERSION}"
   fi
 }
 export -f get_images
@@ -27,16 +27,16 @@ export -f get_images
 ## If the caller provided a tag, build and use that
 export PACH_VERSION=local
 KUBE_VERSION=v1.13.0
-MINIKUBE_FLAGS=(--kubernetes-version="${KUBE_VERSION}")
+MINIKUBE_FLAGS=("--kubernetes-version=${KUBE_VERSION}")
 eval "set -- $( getopt -l "tag:,cpus:,memory:" "--" "${0}" "${@:-}" )"
 while true; do
   case "${1}" in
     --cpus)
-      MINIKUBE_FLAGS+=(--cpus=${2})
+      MINIKUBE_FLAGS+=("--cpus=${2}")
       shift 2
       ;;
     --memory)
-      MINIKUBE_FLAGS+=(--memory=${2})
+      MINIKUBE_FLAGS+=("--memory=${2}")
       shift 2
       ;;
     --tag)
@@ -78,26 +78,31 @@ set -x
 # (extract correct dash image from pachctl deploy)
 dash_image="$(pachctl deploy local -d --dry-run | jq -r '.. | select(.name? == "dash" and has("image")).image')"
 grpc_proxy_image="$(pachctl deploy local -d --dry-run | jq -r '.. | select(.name? == "grpc-proxy").image')"
-etcd_image="quay.io/coreos/etcd:v3.3.5"
-docker pull ${etcd_image}
-docker pull ${grpc_proxy_image}
-docker pull ${dash_image}
-etc/kube/push-to-minikube.sh pachyderm/pachd:${PACH_VERSION}
-etc/kube/push-to-minikube.sh pachyderm/worker:${PACH_VERSION}
+etcd_image="pachyderm/etcd:v3.3.5"
+postgres_image="postgres:11.3"
+docker pull "${etcd_image}"
+docker pull "${grpc_proxy_image}"
+docker pull "${dash_image}"
+docker pull "${postgres_image}"
+etc/kube/push-to-minikube.sh "pachyderm/pachd:${PACH_VERSION}"
+etc/kube/push-to-minikube.sh "pachyderm/worker:${PACH_VERSION}"
 etc/kube/push-to-minikube.sh ${etcd_image}
+etc/kube/push-to-minikube.sh ${postgres_image}
 
 # Deploy Pachyderm
-if [[ "${PACH_VERSION}" = "local" ]]; then
+if [[ -n ${DEPLOY_FLAGS} ]]; then
+  pachctl deploy local -d "${DEPLOY_FLAGS}"
+elif [[ "${PACH_VERSION}" = "local" ]]; then
   pachctl deploy local -d
 else
   # deploy with -d (disable auth, small footprint), but use official version
   pachctl deploy local -d --dry-run | sed "s/:local/:${PACH_VERSION}/g" | kubectl create -f -
 fi
 
-active_kube_context=`kubectl config current-context`
-pachctl config set context $active_kube_context -k $active_kube_context --overwrite
-pachctl config update context $active_kube_context --pachd-address=$(minikube ip):30650
-pachctl config set active-context $active_kube_context
+active_kube_context=$(kubectl config current-context)
+pachctl config set context "$active_kube_context" -k "$active_kube_context" --overwrite
+pachctl config update context "$active_kube_context" --pachd-address="$(minikube ip):30650"
+pachctl config set active-context "$active_kube_context"
 
 # Wait for pachyderm to come up
 set +x
@@ -113,6 +118,9 @@ set -x
 # Kill pachctl port-forward and kubectl proxy
 killall kubectl || true
 
-# Port forward to etcd (for pfs/server/server_test.go)
-export ETCD_POD=$(kubectl get pod -l suite=pachyderm,app=etcd -o jsonpath={.items[].metadata.name})
-kubectl port-forward $ETCD_POD 32379:2379 &
+if [[ "${DEPLOY_FLAGS}" = "--new-storage-layer" ]]; then
+	# Port forward to postgres
+	POSTGRES_POD=$(kubectl get pod -l suite=pachyderm,app=postgres -o jsonpath="{.items[].metadata.name}")
+	export POSTGRES_POD
+	kubectl port-forward "$POSTGRES_POD" 32228:5432 &
+fi

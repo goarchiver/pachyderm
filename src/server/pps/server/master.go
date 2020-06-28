@@ -19,12 +19,12 @@ import (
 
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing/extended"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	pfsServer "github.com/pachyderm/pachyderm/src/server/pfs"
 	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
-	col "github.com/pachyderm/pachyderm/src/server/pkg/collection"
 	"github.com/pachyderm/pachyderm/src/server/pkg/dlock"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsconsts"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsutil"
@@ -39,6 +39,7 @@ var (
 	failures = map[string]bool{
 		"InvalidImageName": true,
 		"ErrImagePull":     true,
+		"Unschedulable":    true,
 	}
 
 	zero     int32 // used to turn down RCs in scaleDownWorkersForPipeline
@@ -52,9 +53,8 @@ func (a *apiServer) master() {
 	backoff.RetryNotify(func() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		// Use the PPS token to authenticate requests. Note that all requests
-		// performed in this function are performed as a cluster admin, so do not
-		// pass any unvalidated user input to any requests
+		// Note: 'pachClient' is unauthenticated. This will use the PPS token (via
+		// a.sudo()) to authenticate requests.
 		pachClient := a.env.GetPachClient(ctx)
 		ctx, err := masterLock.Lock(ctx)
 		if err != nil {
@@ -65,11 +65,11 @@ func (a *apiServer) master() {
 
 		log.Infof("PPS master: launching master process")
 
-		// TODO(msteffen) requestly only keys, since pipeline_controller.go reads
+		// TODO(msteffen) request only keys, since pipeline_controller.go reads
 		// fresh values for each event anyway
 		pipelineWatcher, err := a.pipelines.ReadOnly(ctx).Watch()
 		if err != nil {
-			return fmt.Errorf("error creating watch: %+v", err)
+			return errors.Wrapf(err, "error creating watch")
 		}
 		defer pipelineWatcher.Close()
 
@@ -98,7 +98,7 @@ func (a *apiServer) master() {
 			select {
 			case event := <-pipelineWatcher.Watch():
 				if event.Err != nil {
-					return fmt.Errorf("event err: %+v", event.Err)
+					return errors.Wrapf(event.Err, "event err")
 				}
 				switch event.Type {
 				case watch.EventPut:
@@ -140,9 +140,18 @@ func (a *apiServer) master() {
 				if pod.Status.Phase == v1.PodFailed {
 					log.Errorf("pod failed because: %s", pod.Status.Message)
 				}
+				pipelineName := pod.ObjectMeta.Annotations["pipelineName"]
 				for _, status := range pod.Status.ContainerStatuses {
-					if status.Name == "user" && status.State.Waiting != nil && failures[status.State.Waiting.Reason] {
-						if err := a.setPipelineFailure(ctx, pod.ObjectMeta.Annotations["pipelineName"], status.State.Waiting.Message); err != nil {
+					if status.State.Waiting != nil && failures[status.State.Waiting.Reason] {
+						if err := a.setPipelineCrashing(pachClient.Ctx(), pipelineName, status.State.Waiting.Message); err != nil {
+							return err
+						}
+					}
+				}
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == v1.PodScheduled &&
+						condition.Status != v1.ConditionTrue && failures[condition.Reason] {
+						if err := a.setPipelineCrashing(pachClient.Ctx(), pipelineName, condition.Message); err != nil {
 							return err
 						}
 					}
@@ -164,19 +173,35 @@ func (a *apiServer) master() {
 }
 
 func (a *apiServer) setPipelineFailure(ctx context.Context, pipelineName string, reason string) error {
-	return ppsutil.FailPipeline(ctx, a.env.GetEtcdClient(), a.pipelines, pipelineName, reason)
+	return a.setPipelineState(ctx, pipelineName, pps.PipelineState_PIPELINE_FAILURE, reason)
 }
 
-// every running pipeline with standby == true has a corresponding goroutine
+func (a *apiServer) setPipelineCrashing(ctx context.Context, pipelineName string, reason string) error {
+	return a.setPipelineState(ctx, pipelineName, pps.PipelineState_PIPELINE_CRASHING, reason)
+}
+
+// Every running pipeline with standby == true has a corresponding goroutine
 // running monitorPipeline() that puts the pipeline in and out of standby in
 // response to new output commits appearing in that pipeline's output repo
 func (a *apiServer) cancelMonitor(pipeline string) {
 	a.monitorCancelsMu.Lock()
+	defer a.monitorCancelsMu.Unlock()
 	if cancel, ok := a.monitorCancels[pipeline]; ok {
 		cancel()
 		delete(a.monitorCancels, pipeline)
 	}
-	a.monitorCancelsMu.Unlock()
+}
+
+// Every crashing pipeline has a corresponding goro running
+// monitorCrashingPipeline that checks to see if the issues have resolved
+// themselves and moves the pipeline out of crashing if they have.
+func (a *apiServer) cancelCrashingMonitor(pipeline string) {
+	a.monitorCancelsMu.Lock()
+	defer a.monitorCancelsMu.Unlock()
+	if cancel, ok := a.crashingMonitorCancels[pipeline]; ok {
+		cancel()
+		delete(a.crashingMonitorCancels, pipeline)
+	}
 }
 
 func (a *apiServer) deletePipelineResources(ctx context.Context, pipelineName string) (retErr error) {
@@ -190,6 +215,8 @@ func (a *apiServer) deletePipelineResources(ctx context.Context, pipelineName st
 
 	// Cancel any running monitorPipeline call
 	a.cancelMonitor(pipelineName)
+	// Same for cancelCrashingMonitor
+	a.cancelCrashingMonitor(pipelineName)
 
 	kubeClient := a.env.GetKubeClient()
 	// Delete any services associated with op.pipeline
@@ -199,23 +226,23 @@ func (a *apiServer) deletePipelineResources(ctx context.Context, pipelineName st
 	}
 	services, err := kubeClient.CoreV1().Services(a.namespace).List(metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("could not list services: %v", err)
+		return errors.Wrapf(err, "could not list services")
 	}
 	for _, service := range services.Items {
 		if err := kubeClient.CoreV1().Services(a.namespace).Delete(service.Name, opts); err != nil {
 			if !isNotFoundErr(err) {
-				return fmt.Errorf("could not delete service %q: %v", service.Name, err)
+				return errors.Wrapf(err, "could not delete service %q", service.Name)
 			}
 		}
 	}
 	rcs, err := kubeClient.CoreV1().ReplicationControllers(a.namespace).List(metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("could not list RCs: %v", err)
+		return errors.Wrapf(err, "could not list RCs")
 	}
 	for _, rc := range rcs.Items {
 		if err := kubeClient.CoreV1().ReplicationControllers(a.namespace).Delete(rc.Name, opts); err != nil {
 			if !isNotFoundErr(err) {
-				return fmt.Errorf("could not delete RC %q: %v", rc.Name, err)
+				return errors.Wrapf(err, "could not delete RC %q: %v", rc.Name)
 			}
 		}
 	}
@@ -234,37 +261,31 @@ func notifyCtx(ctx context.Context, name string) func(error, time.Duration) erro
 	}
 }
 
-func (a *apiServer) setPipelineState(pachClient *client.APIClient, pipelineInfo *pps.PipelineInfo, state pps.PipelineState, reason string) (retErr error) {
-	span, ctx := tracing.AddSpanToAnyExisting(pachClient.Ctx(), "/pps.Master/SetPipelineState",
-		"pipeline", pipelineInfo.Pipeline.Name, "new-state", state)
-	if span != nil {
-		pachClient = pachClient.WithCtx(ctx)
-	}
+// setPipelineState is a PPS-master-specific helper that wraps
+// ppsutil.SetPipelineState in a trace
+func (a *apiServer) setPipelineState(ctx context.Context, pipeline string, state pps.PipelineState, reason string) (retErr error) {
+	span, ctx := tracing.AddSpanToAnyExisting(ctx,
+		"/pps.Master/SetPipelineState", "pipeline", pipeline, "new-state", state)
 	defer func() {
 		tracing.TagAnySpan(span, "err", retErr)
 		tracing.FinishAnySpan(span)
 	}()
-	parallelism, err := ppsutil.GetExpectedNumWorkers(a.env.GetKubeClient(), pipelineInfo.ParallelismSpec)
-	if err != nil {
-		return err
-	}
-	log.Infof("moving pipeline %s to %s", pipelineInfo.Pipeline.Name, state.String())
-	_, err = col.NewSTM(pachClient.Ctx(), a.env.GetEtcdClient(), func(stm col.STM) error {
-		pipelines := a.pipelines.ReadWrite(stm)
-		pipelinePtr := &pps.EtcdPipelineInfo{}
-		if err := pipelines.Get(pipelineInfo.Pipeline.Name, pipelinePtr); err != nil {
-			return err
-		}
-		tracing.TagAnySpan(span, "old-state", pipelinePtr.State)
-		if pipelinePtr.State == pps.PipelineState_PIPELINE_FAILURE {
-			return nil
-		}
-		pipelinePtr.State = state
-		pipelinePtr.Reason = reason
-		pipelinePtr.Parallelism = uint64(parallelism)
-		return pipelines.Put(pipelineInfo.Pipeline.Name, pipelinePtr)
-	})
-	return err
+	return ppsutil.SetPipelineState(ctx, a.env.GetEtcdClient(), a.pipelines,
+		pipeline, nil, state, reason)
+}
+
+// transitionPipelineState is similar to setPipelineState, except that it sets
+// 'from' and logs a different trace
+func (a *apiServer) transitionPipelineState(ctx context.Context, pipeline string, from, to pps.PipelineState, reason string) (retErr error) {
+	span, ctx := tracing.AddSpanToAnyExisting(ctx,
+		"/pps.Master/TransitionPipelineState", "pipeline", pipeline,
+		"from-state", from, "to-state", to)
+	defer func() {
+		tracing.TagAnySpan(span, "err", retErr)
+		tracing.FinishAnySpan(span)
+	}()
+	return ppsutil.SetPipelineState(ctx, a.env.GetEtcdClient(), a.pipelines,
+		pipeline, &from, to, reason)
 }
 
 func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *pps.PipelineInfo) {
@@ -308,7 +329,19 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 				}
 				defer tracing.FinishAnySpan(span)
 
-				if err := a.setPipelineState(pachClient, pipelineInfo, pps.PipelineState_PIPELINE_STANDBY, ""); err != nil {
+				if err := a.transitionPipelineState(pachClient.Ctx(),
+					pipelineInfo.Pipeline.Name,
+					pps.PipelineState_PIPELINE_RUNNING,
+					pps.PipelineState_PIPELINE_STANDBY, ""); err != nil {
+					if pte, ok := err.(ppsutil.PipelineTransitionError); ok &&
+						pte.Current == pps.PipelineState_PIPELINE_PAUSED {
+						// pipeline is stopped, exit monitorPipeline (which pausing the
+						// pipeline should also do). monitorPipeline will be called when
+						// it transitions back to running
+						// TODO(msteffen): this should happen in the pipeline
+						// controller
+						return nil
+					}
 					return err
 				}
 				var (
@@ -337,7 +370,15 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 							pachClient = oldPachClient.WithCtx(ctx)
 						}
 
-						if err := a.setPipelineState(pachClient, pipelineInfo, pps.PipelineState_PIPELINE_RUNNING, ""); err != nil {
+						if err := a.transitionPipelineState(pachClient.Ctx(),
+							pipelineInfo.Pipeline.Name,
+							pps.PipelineState_PIPELINE_STANDBY,
+							pps.PipelineState_PIPELINE_RUNNING, ""); err != nil {
+							if pte, ok := err.(ppsutil.PipelineTransitionError); ok &&
+								pte.Current == pps.PipelineState_PIPELINE_PAUSED {
+								// pipeline is stopped, exit monitorPipeline (see above)
+								return nil
+							}
 							return err
 						}
 
@@ -360,7 +401,18 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 							}
 						}
 
-						if err := a.setPipelineState(pachClient, pipelineInfo, pps.PipelineState_PIPELINE_STANDBY, ""); err != nil {
+						if err := a.transitionPipelineState(pachClient.Ctx(),
+							pipelineInfo.Pipeline.Name,
+							pps.PipelineState_PIPELINE_RUNNING,
+							pps.PipelineState_PIPELINE_STANDBY, ""); err != nil {
+							if pte, ok := err.(ppsutil.PipelineTransitionError); ok &&
+								pte.Current == pps.PipelineState_PIPELINE_PAUSED {
+								// pipeline is stopped; monitorPipeline will be called when it
+								// transitions back to running
+								// TODO(msteffen): this should happen in the pipeline
+								// controller
+								return nil
+							}
 							return err
 						}
 					case <-pachClient.Ctx().Done():
@@ -380,6 +432,38 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 	}
 	if err := eg.Wait(); err != nil {
 		log.Printf("error in monitorPipeline: %v", err)
+	}
+}
+
+func (a *apiServer) monitorCrashingPipeline(ctx context.Context, op *pipelineOp) {
+	defer a.cancelMonitor(op.name)
+For:
+	for {
+		select {
+		case <-time.After(crashingBackoff):
+		case <-ctx.Done():
+			break For
+		}
+		time.Sleep(crashingBackoff)
+		workersUp, err := op.allWorkersUp()
+		if err != nil {
+			log.Printf("error in monitorCrashingPipeline: %v", err)
+			continue
+		}
+		if workersUp {
+			if err := a.transitionPipelineState(ctx, op.name,
+				pps.PipelineState_PIPELINE_CRASHING,
+				pps.PipelineState_PIPELINE_RUNNING, ""); err != nil {
+				if pte, ok := err.(ppsutil.PipelineTransitionError); ok &&
+					pte.Current == pps.PipelineState_PIPELINE_CRASHING {
+					log.Print(err) // Pipeline has moved to STOPPED or been updated--give up
+					return
+				}
+				log.Printf("error in monitorCrashingPipeline: %v", err)
+				continue
+			}
+			break
+		}
 	}
 }
 
@@ -419,7 +503,7 @@ func (a *apiServer) makeCronCommits(pachClient *client.APIClient, in *pps.Input)
 		return err
 	} else if commitInfo != nil && commitInfo.Finished == nil {
 		// and if there is, delete it
-		if err = pachClient.DeleteCommit(in.Cron.Repo, "master"); err != nil {
+		if err = pachClient.DeleteCommit(in.Cron.Repo, commitInfo.Commit.ID); err != nil {
 			return err
 		}
 	}
@@ -451,14 +535,14 @@ func (a *apiServer) makeCronCommits(pachClient *client.APIClient, in *pps.Input)
 			// get rid of any files, so the new file "overwrites" previous runs
 			err = pachClient.DeleteFile(in.Cron.Repo, "master", "")
 			if err != nil && !isNotFoundErr(err) && !pfsServer.IsNoHeadErr(err) {
-				return fmt.Errorf("delete error %v", err)
+				return errors.Wrapf(err, "delete error")
 			}
 		}
 
 		// Put in an empty file named by the timestamp
 		_, err = pachClient.PutFile(in.Cron.Repo, "master", next.Format(time.RFC3339), strings.NewReader(""))
 		if err != nil {
-			return fmt.Errorf("put error %v", err)
+			return errors.Wrapf(err, "put error")
 		}
 
 		err = pachClient.FinishCommit(in.Cron.Repo, "master")

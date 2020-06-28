@@ -1,12 +1,12 @@
 package hashtree
 
 import (
-	"fmt"
 	"io"
 	"reflect"
 	"sync"
 
 	"github.com/hashicorp/golang-lru/simplelru"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/server/pkg/localcache"
 	"github.com/sirupsen/logrus"
 )
@@ -27,7 +27,7 @@ type Cache struct {
 func castValue(value interface{}) (HashTree, error) {
 	tree, ok := value.(HashTree)
 	if !ok {
-		return nil, fmt.Errorf("corrupted cache: expected HashTree, found: %v", reflect.TypeOf(value))
+		return nil, errors.Errorf("corrupted cache: expected HashTree, found: %v", reflect.TypeOf(value))
 	}
 	return tree, nil
 }
@@ -130,25 +130,23 @@ type MergeCache struct {
 }
 
 // NewMergeCache creates a new cache.
-func NewMergeCache(root string) *MergeCache {
-	return &MergeCache{
-		Cache: localcache.NewCache(root),
+func NewMergeCache(root string) (*MergeCache, error) {
+	cache, err := localcache.NewCache(root)
+	if err != nil {
+		return nil, err
 	}
+
+	return &MergeCache{Cache: cache}, nil
 }
 
 // Put puts an id/hashtree pair in the cache and reads the hashtree from the passed in io.Reader.
-func (c *MergeCache) Put(id int64, tree io.Reader) (retErr error) {
-	return c.Cache.Put(fmt.Sprint(id), tree)
-}
-
-// Has returns true if the key is present in the cache, false otherwise.
-func (c *MergeCache) Has(id int64) bool {
-	return c.Cache.Has(fmt.Sprint(id))
+func (c *MergeCache) Put(id string, tree io.Reader) (retErr error) {
+	return c.Cache.Put(id, tree)
 }
 
 // Get does a filtered write of id's hashtree to the passed in io.Writer.
-func (c *MergeCache) Get(id int64, w io.Writer, filter Filter) (retErr error) {
-	r, err := c.Cache.Get(fmt.Sprint(id))
+func (c *MergeCache) Get(id string, w io.Writer, filter Filter) (retErr error) {
+	r, err := c.Cache.Get(id)
 	if err != nil {
 		return err
 	}
@@ -161,8 +159,18 @@ func (c *MergeCache) Get(id int64, w io.Writer, filter Filter) (retErr error) {
 }
 
 // Delete deletes a hashtree from the cache.
-func (c *MergeCache) Delete(id int64) error {
-	return c.Cache.Delete(fmt.Sprint(id))
+func (c *MergeCache) Delete(id string) error {
+	return c.Cache.Delete(id)
+}
+
+// Has returns true if the given id is present in the cache, false otherwise.
+func (c *MergeCache) Has(id string) bool {
+	return c.Cache.Has(id)
+}
+
+// Keys returns the list of hashtree IDs in the cache.
+func (c *MergeCache) Keys() []string {
+	return c.Cache.Keys()
 }
 
 // Merge does a filtered merge of the hashtrees in the cache.

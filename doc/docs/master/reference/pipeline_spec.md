@@ -12,6 +12,14 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
     "name": string
   },
   "description": string,
+  "metadata": {
+    "annotations": {
+        "annotation": string
+    },
+    "labels": {
+        "label": string
+    }
+  },
   "transform": {
     "image": string,
     "cmd": [ string ],
@@ -58,12 +66,17 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
     }
     "disk": string,
   },
+  "sidecar_resource_limits": {
+    "memory": string,
+    "cpu": number
+  },
   "datum_timeout": string,
   "datum_tries": int,
   "job_timeout": string,
   "input": {
     <"pfs", "cross", "union", "cron", or "git" see below>
   },
+  "s3_out": bool,
   "output_branch": string,
   "egress": {
     "URL": "s3://bucket/dir"
@@ -80,10 +93,7 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
   \\ Optionally, you can combine a spout with a service:
   "service": {
         "internal_port": int,
-        "external_port": int,
-        "annotations": {
-            "foo": "bar"
-        }
+        "external_port": int
     }
   },
   "max_queue_size": int,
@@ -109,7 +119,8 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
   "branch": string,
   "glob": string,
   "lazy" bool,
-  "empty_files": bool
+  "empty_files": bool,
+  "s3": bool
 }
 
 ------------------------------------
@@ -125,6 +136,7 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
       "glob": string,
       "lazy" bool,
       "empty_files": bool
+      "s3": bool
     }
   },
   {
@@ -135,6 +147,7 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
       "glob": string,
       "lazy" bool,
       "empty_files": bool
+      "s3": bool
     }
   }
   ...
@@ -168,6 +181,7 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
       "join_on": string
       "lazy": bool
       "empty_files": bool
+      "s3": bool
     }
   },
   {
@@ -179,6 +193,7 @@ create pipeline](pachctl/pachctl_create_pipeline.md) section.
        "join_on": string
        "lazy": bool
        "empty_files": bool
+       "s3": bool
     }
   }
 ]
@@ -232,6 +247,14 @@ requirements:
 `description` is an optional text field where you can add information
 about the pipeline.
 
+### Metadata
+
+This parameter enables you to add metadata to your pipeline pods by using Kubernetes' `labels` and `annotations`. Labels help you to organize and keep track of your cluster objects by creating groups of pods based on the application they run, resources they use, or other parameters. Labels simplify the querying of Kubernetes objects and are handy in operations.
+
+Similarly to labels, you can add metadata through annotations. The difference is that you can specify any arbitrary metadata through annotations.
+
+Both parameters require a key-value pair.  Do not confuse this parameter with `pod_patch` which adds metadata to the user container of the pipeline pod. For more information, see [Labels and Selectors](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/) and [Kubernetes Annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/) in the Kubernetes documentation.
+
 ### Transform (required)
 
 `transform.image` is the name of the Docker image that your jobs use.
@@ -259,11 +282,18 @@ on `stdin`.
 Lines do not have to end in newline characters.
 
 `transform.env` is a key-value map of environment variables that
-Pachyderm injects into the container.
+Pachyderm injects into the container. Pachyderm injects into the
+container. There are also environment variables
+that are automatically injected into the container, such as:
 
-**Note:** There are environment variables that are automatically injected
-into the container, for a comprehensive list of them see the [Environment
-Variables](#environment-variables) section below.
+* `PACH_JOB_ID` – the ID of the current job.
+* `PACH_OUTPUT_COMMIT_ID` – the ID of the commit in the output repo for 
+the current job.
+* `<input>_COMMIT` - the ID of the input commit. For example, if your
+input is the `images` repo, this will be `images_COMMIT`.
+
+For a complete list of variables and
+descriptions see: [Configure Environment Variables](../../deploy-manage/deploy/environment-variables/).
 
 `transform.secrets` is an array of secrets. You can use the secrets to
 embed sensitive data, such as credentials. The secrets reference
@@ -326,18 +356,33 @@ modify the default `parallism_spec` value for these pipelines.
 
 ### Resource Requests (optional)
 
-`resource_requests` describes the amount of resources you expect the
-workers for a given pipeline to consume. Knowing this in advance
-lets Pachyderm schedule big jobs on separate machines, so that they do not
-conflict and either slow down or die.
+`resource_requests` describes the amount of resources that the pipeline
+workers will consume. Knowing this in advance
+enables Pachyderm to schedule big jobs on separate machines, so that they
+do not conflict, slow down, or terminate.
+
+This parameter is optional, and if you do not explicitly add it in
+the pipeline spec, Pachyderm creates Kubernetes containers with the
+following default resources: 
+
+- The user container requests 0 CPU, 0 disk space, and 64MB of memory. 
+- The init container requests the same amount of CPU, memory, and disk
+space that is set for the user container.
+- The storage container requests 0 CPU and the amount of memory set by the
+[cache_size](#cache-size-optional) parameter.
+
+The `resource_requests` parameter enables you to overwrite these default
+values.
 
 The `memory` field is a string that describes the amount of memory, in bytes,
-each worker needs (with allowed SI suffixes (M, K, G, Mi, Ki, Gi, and so on).
+that each worker needs. Allowed SI suffixes include M, K, G, Mi, Ki, Gi, and
+other.
+
 For example, a worker that needs to read a 1GB file into memory might set
 `"memory": "1.2G"` with a little extra for the code to use in addition to the
 file. Workers for this pipeline will be placed on machines with at least
-1.2GB of free memory, and other large workers will be prevented from using it
-(if they also set their `resource_requests`).
+1.2GB of free memory, and other large workers will be prevented from using it,
+if they also set their `resource_requests`.
 
 The `cpu` field is a number that describes the amount of CPU time in `cpu
 seconds/real seconds` that each worker needs. Setting `"cpu": 0.5` indicates that
@@ -347,8 +392,8 @@ it is using 2 CPUs, though worker threads might spend 500ms on four
 physical CPUs instead of one second on two physical CPUs.
 
 The `disk` field is a string that describes the amount of ephemeral disk space,
-in bytes, each worker needs with allowed SI suffixes (M, K, G, Mi, Ki, Gi,
-and so on).
+in bytes, that each worker needs. Allowed SI suffixes include M, K, G, Mi,
+Ki, Gi, and other.
 
 In both cases, the resource requests are not upper bounds. If the worker uses
 more memory than it is requested, it does not mean that it will be shut down.
@@ -360,11 +405,6 @@ a sufficiently large value. However, if the total memory requested by all
 workers in the system is too large, Kubernetes cannot schedule new
 workers because no machine has enough unclaimed memory. `cpu` works
 similarly, but for CPU time.
-
-By default, workers are scheduled with an effective resource request of 0 (to
-avoid scheduling problems that prevent users from being unable to run
-pipelines). This means that if a node runs out of memory, any such worker
-might be terminated.
 
 For more information about resource requests and limits see the
 [Kubernetes docs](https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/)
@@ -385,11 +425,25 @@ nothing to process. For more information about scheduling GPUs see the
 [Kubernetes docs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
 on the subject.
 
+### Sidecar Resource Limits (optional)
+
+`sidecar_resource_limits` determines the upper threshold of resources
+allocated to the sidecar containers.
+
+This field can be useful in deployments where Kubernetes automatically
+applies resource limits to containers, which might conflict with Pachyderm
+pipelines' resource requests. Such a deployment might fail if Pachyderm
+requests more than the default Kubernetes limit. The `sidecar_resource_limits`
+enables you to explicitly specify these resources to fix the issue.
+
 ### Datum Timeout (optional)
 
-`datum_timeout` is a string (e.g. `1s`, `5m`, or `15h`) that determines the
-maximum execution time allowed per datum. So no matter what your parallelism
-or number of datums, no single datum is allowed to exceed this value.
+`datum_timeout` determines the maximum execution time allowed for each
+datum. The value must be a string that represents a time value, such as
+`1s`, `5m`, or `15h`. This parameter takes precedence over the parallelism
+or number of datums, therefore, no single datum is allowed to exceed
+this value. By default, `datum_timeout` is not set, and the datum continues to
+be processed as long as needed.
 
 ### Datum Tries (optional)
 
@@ -402,13 +456,33 @@ is marked as failed.
 
 ### Job Timeout (optional)
 
-`job_timeout` is a string (e.g. `1s`, `5m`, or `15h`) that determines the
-maximum execution time allowed for a job. It differs from `datum_timeout`
-in that the limit gets applied across all workers and all datums. That
-means that you'll need to keep in mind the parallelism, total number of
-datums, and execution time per datum when setting this value. Keep in
-mind that the number of datums may change over jobs. Some new commits may
-have a bunch of new files (and so new datums). Some may have fewer.
+`job_timeout` determines the maximum execution time allowed for a job. It
+differs from `datum_timeout` in that the limit is applied across all
+workers and all datums. This is the *wall time*, which means that if
+you set `job_timeout` to one hour and the job does not finish the work
+in one hour, it will be interrupted.
+When you set this value, you need to
+consider the parallelism, total number of datums, and execution time per
+datum. The value must be a string that represents a time value, such as
+`1s`, `5m`, or `15h`. In addition, the number of datums might change over
+jobs. Some new commits might have more files, and therefore, more datums.
+Similarly, other commits might have fewer files and datums. If this
+parameter is not set, the job will run indefinitely until it succeeds or fails.
+
+### S3 Output Repository
+
+`s3_out` allows your pipeline code to write results out to an S3 gateway
+endpoint instead of the typical `pfs/out` directory. When this parameter
+is set to `true`, Pachyderm includes a sidecar S3 gateway instance
+container in the same pod as the pipeline container. The address of the
+output repository will be `s3://<output_repo>`. If you enable `s3_out`,
+verify that the `enable_stats` parameter is disabled.
+
+If you want to expose an input repository through an S3 gateway, see
+`input.pfs.s3` in [PFS Input](#pfs-input). 
+
+!!! note "See Also:"
+    [Environment Variables](../../deploy-manage/deploy/environment-variables/)
 
 ### Input (required)
 
@@ -441,6 +515,7 @@ single repo.
     "glob": string,
     "lazy" bool,
     "empty_files": bool
+    "s3": bool
 }
 ```
 
@@ -478,13 +553,32 @@ with pipes must use them since they are more performant. The difference will
 be especially notable if the job only reads a subset of the files that are
 available to it.
 
-**Note:** `lazy` currently does not support datums that
-contain more than 10000 files.
+!!! note
+    `lazy` does not support datums that
+    contain more than 10000 files.
 
 `input.pfs.empty_files` controls how files are exposed to jobs. If
 set to `true`, it causes files from this PFS to be presented as empty files.
 This is useful in shuffle pipelines where you want to read the names of
 files and reorganize them by using symlinks.
+
+`input.pfs.s3` sets whether the sidecar in the pipeline worker pod
+should include a sidecar S3 gateway instance. This option enables an S3 gateway
+to serve on a pipeline-level basis and, therefore, ensure provenance tracking
+for pipelines that integrate with external systems, such as Kubeflow. When
+this option is set to `true`, Pachyderm deploys an S3 gateway instance
+alongside the pipeline container and creates an S3 bucket for the pipeline
+input repo. The address of the
+input repository will be `s3://<input_repo>`. When you enable this
+parameter, you cannot use glob patterns. All files will be processed
+as one datum.
+
+Another limitation for S3-enabled pipelines is that you can only use
+either a single input or a cross input. Join and union inputs are not
+supported.
+
+If you want to expose an output repository through an S3
+gateway, see [S3 Output Repository](#s3-output-repository).
 
 #### Union Input
 
@@ -492,7 +586,7 @@ Union inputs take the union of other inputs. In the example
 below, each input includes individual datums, such as if  `foo` and `bar`
 were in the same repository with the glob pattern set to `/*`.
 Alternatively, each of these datums might have come from separate repositories
-with the glob pattern set to `/` and being the only filesystm objects in these
+with the glob pattern set to `/` and being the only file system objects in these
 repositories.
 
 ```
@@ -525,7 +619,7 @@ a cross input creates tuples of the datums in the inputs. In the example
 below, each input includes individual datums, such as if  `foo` and `bar`
 were in the same repository with the glob pattern set to `/*`.
 Alternatively, each of these datums might have come from separate repositories
-with the glob pattern set to `/` and being the only filesystm objects in these
+with the glob pattern set to `/` and being the only file system objects in these
 repositories.
 
 ```
@@ -591,10 +685,11 @@ on matching times in the future. Format the time value according to [RFC
 `input.cron.overwrite` is a flag to specify whether you want the timestamp file
 to be overwritten on each tick. This parameter is optional, and if you do not
 specify it, it defaults to simply writing new files on each tick. By default,
-`pachd` expects only the new information to be written out on each tick
-and combines that data with the data from the previous ticks. If `"overwrite"`
-is set to `true`, it expects the full dataset to be written out for each tick and
-replaces previous outputs with the new data written out.
+when `"overwrite"` is disabled, ticks accumulate in the cron input repo. When
+`"overwrite"` is enabled, Pachyderm erases the old ticks and adds new ticks
+with each commit. If you do not add any manual ticks or run
+`pachctl run cron`, only one tick file per commit (for the latest tick)
+is added to the input repo.
 
 #### Join Input
 
@@ -713,6 +808,7 @@ repo called `"stats"`. This branch stores information about each datum that
 the pipeline processes, including timing information, size information, logs,
 and `/pfs` snapshots. You can view this statistics by running the `pachctl
 inspect datum` and `pachctl list datum` commands, as well as through the web UI.
+Do not enable statistics tracking for S3-enabled pipelines.
 
 Once turned on, statistics tracking cannot be disabled for the pipeline. You can
 turn it off by deleting the pipeline, setting `enable_stats` to `false` or
@@ -819,7 +915,7 @@ formatted patch by diffing the two pod specs.
 
 ## The Input Glob Pattern
 
-Each PFS input needs to specify a [glob pattern](../concepts/pipeline-concepts/datum/glob-pattern/).
+Each PFS input needs to specify a [glob pattern](../../concepts/pipeline-concepts/datum/glob-pattern/).
 
 Pachyderm uses the glob pattern to determine how many "datums" an input
 consists of.  Datums are the unit of parallelism in Pachyderm.  That is,
@@ -863,34 +959,3 @@ The root mount point is at `/pfs`, which contains:
   - Each input will be found here by its name, which defaults to the repo
   name if not specified.
 - `/pfs/out` which is where you write any output.
-
-# Environment Variables
-
-There are several environment variables that get injected into the user code
-before it runs. They are:
-
-- `PACH_JOB_ID` the id the currently run job.
-- `PACH_OUTPUT_COMMIT_ID` the id of the commit being outputted to.
-- For each input there will be an environment variable with the same name
-    defined to the path of the file for that input. For example if you are
-    accessing an input called `foo` from the path `/pfs/foo` which contains a
-    file called `bar` then the environment variable `foo` will have the value
-    `/pfs/foo/bar`. The path in the environment variable is the path which
-    matched the glob pattern, even if the file is a directory, ie if your glob
-    pattern is `/*` it would match a directory `/bar`, the value of `$foo`
-    would then be `/pfs/foo/bar`. With a glob pattern of `/*/*` you would match
-    the files contained in `/bar` and thus the value of `foo` would be
-    `/pfs/foo/bar/quux`.
-- For each input there will be an environment variable named `input_COMMIT`
-    indicating the id of the commit being used for that input.
-
-In addition to these environment variables Kubernetes also injects others for
-Services that are running inside the cluster. These allow you to connect to
-those outside services, which can be powerful but also can be hard to reason
-about, as processing might be retried multiple times. For example if your code
-writes a row to a database that row may be written multiple times due to
-retries. Interaction with outside services should be [idempotent](https://en.wikipedia.org/wiki/Idempotence) to prevent
-unexpected behavior. Furthermore, one of the running services that your code
-can connect to is Pachyderm itself, this is generally not recommended as very
-little of the Pachyderm API is idempotent, but in some specific cases it can be
-a viable approach.

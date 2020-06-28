@@ -7,11 +7,11 @@ import (
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/enterprise"
 	"github.com/pachyderm/pachyderm/src/client/pkg/config"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/version"
 	"github.com/pachyderm/pachyderm/src/server/pkg/serviceenv"
 	"github.com/pachyderm/pachyderm/src/server/pkg/uuid"
 
-	"github.com/segmentio/analytics-go"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/metadata"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,18 +20,24 @@ import (
 
 //Reporter is used to submit user & cluster metrics to segment
 type Reporter struct {
-	segmentClient *analytics.Client
-	clusterID     string
-	env           *serviceenv.ServiceEnv
+	router    *router
+	clusterID string
+	env       *serviceenv.ServiceEnv
 }
 
 // NewReporter creates a new reporter and kicks off the loop to report cluster
 // metrics
 func NewReporter(clusterID string, env *serviceenv.ServiceEnv) *Reporter {
+	var r *router
+	if env.MetricsEndpoint != "" {
+		r = newRouter(env.MetricsEndpoint)
+	} else {
+		r = newRouter()
+	}
 	reporter := &Reporter{
-		segmentClient: newPersistentClient(),
-		clusterID:     clusterID,
-		env:           env,
+		router:    r,
+		clusterID: clusterID,
+		env:       env,
 	}
 	go reporter.reportClusterMetrics()
 	return reporter
@@ -59,7 +65,7 @@ func getKeyFromMD(md metadata.MD, key string) (string, error) {
 	if md[key] != nil && len(md[key]) > 0 {
 		return md[key][0], nil
 	}
-	return "", fmt.Errorf("error extracting userid from metadata. userid is empty")
+	return "", errors.Errorf("error extracting userid from metadata. userid is empty")
 }
 
 func (r *Reporter) reportUserAction(ctx context.Context, action string, value interface{}) {
@@ -76,8 +82,7 @@ func (r *Reporter) reportUserAction(ctx context.Context, action string, value in
 			// metrics errors are non fatal
 			return
 		}
-		reportUserMetricsToSegment(
-			r.segmentClient,
+		r.router.reportUserMetricsToSegment(
 			userID,
 			prefix,
 			action,
@@ -142,14 +147,14 @@ func (r *Reporter) reportClusterMetrics() {
 		metrics.ClusterID = r.clusterID
 		metrics.PodID = uuid.NewWithoutDashes()
 		metrics.Version = version.PrettyPrintVersion(version.Version)
-		reportClusterMetricsToSegment(r.segmentClient, metrics)
+		r.router.reportClusterMetricsToSegment(metrics)
 	}
 }
 
 func externalMetrics(kubeClient *kube.Clientset, metrics *Metrics) error {
 	nodeList, err := kubeClient.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("externalMetrics: unable to retrieve node list from k8s: %v", err)
+		return errors.Wrapf(err, "externalMetrics: unable to retrieve node list from k8s")
 	}
 	metrics.Nodes = int64(len(nodeList.Items))
 	return nil

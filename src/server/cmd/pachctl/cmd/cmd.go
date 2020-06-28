@@ -1,9 +1,7 @@
 package cmd
 
 import (
-	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,13 +13,9 @@ import (
 	"time"
 	"unicode"
 
-	etcd "github.com/coreos/etcd/clientv3"
-	"github.com/fatih/color"
-	"github.com/gogo/protobuf/jsonpb"
-	"github.com/gogo/protobuf/types"
-	"github.com/juju/ansiterm"
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/pkg/config"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/version"
 	"github.com/pachyderm/pachyderm/src/client/version/versionpb"
 	admincmds "github.com/pachyderm/pachyderm/src/server/admin/cmds"
@@ -37,11 +31,16 @@ import (
 	"github.com/pachyderm/pachyderm/src/server/pkg/metrics"
 	ppscmds "github.com/pachyderm/pachyderm/src/server/pps/cmds"
 	txncmds "github.com/pachyderm/pachyderm/src/server/transaction/cmds"
-	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 
+	etcd "github.com/coreos/etcd/clientv3"
+	"github.com/fatih/color"
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/types"
+	"github.com/juju/ansiterm"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/status"
@@ -345,6 +344,7 @@ Environment variables:
 					ioutil.Discard,
 					ioutil.Discard,
 				))
+				cmdutil.PrintErrorStacks = true
 			}
 		},
 		BashCompletionFunction: bashCompletionFunc,
@@ -400,7 +400,7 @@ Environment variables:
 				var timeout time.Duration
 				timeout, err = time.ParseDuration(timeoutFlag)
 				if err != nil {
-					return fmt.Errorf("could not parse timeout duration %q: %v", timeout, err)
+					return errors.Wrapf(err, "could not parse timeout duration %q", timeout)
 				}
 				pachClient, err = client.NewOnUserMachine("user", client.WithDialTimeout(timeout))
 			} else {
@@ -446,6 +446,12 @@ Environment variables:
 		"default timeout; if set to 0s, the call will never time out.")
 	versionCmd.Flags().AddFlagSet(rawFlags)
 	subcommands = append(subcommands, cmdutil.CreateAlias(versionCmd, "version"))
+	exitCmd := &cobra.Command{
+		Short: "Exit the pachctl shell.",
+		Long:  "Exit the pachctl shell.",
+		Run:   cmdutil.RunFixedArgs(0, func(args []string) error { return nil }),
+	}
+	subcommands = append(subcommands, cmdutil.CreateAlias(exitCmd, "exit"))
 
 	var maxCompletions int64
 	shellCmd := &cobra.Command{
@@ -499,20 +505,16 @@ This resets the cluster to its initial state.`,
 			if len(pipelines) > 0 {
 				fmt.Printf("Pipelines to delete: %s\n", strings.Join(pipelines, ", "))
 			}
-			fmt.Println("Are you sure you want to do this? (y/n):")
-			r := bufio.NewReader(os.Stdin)
-			bytes, err := r.ReadBytes('\n')
-			if err != nil {
+			if ok, err := cmdutil.InteractiveConfirm(); err != nil {
+				return err
+			} else if !ok {
+				return nil
+			}
+
+			if err := client.DeleteAll(); err != nil {
 				return err
 			}
-			if bytes[0] == 'y' || bytes[0] == 'Y' {
-				err = client.DeleteAll()
-				if err != nil {
-					return err
-				}
-				return txncmds.ClearActiveTransaction()
-			}
-			return nil
+			return txncmds.ClearActiveTransaction()
 		}),
 	}
 	subcommands = append(subcommands, cmdutil.CreateAlias(deleteAll, "delete all"))
@@ -538,7 +540,7 @@ This resets the cluster to its initial state.`,
 			if err != nil {
 				return err
 			}
-			contextName, context, err := cfg.ActiveContext()
+			contextName, context, err := cfg.ActiveContext(true)
 			if err != nil {
 				return err
 			}
@@ -954,7 +956,7 @@ func createCompletions(rootCmd *cobra.Command, install bool, installPath string,
 			if os.IsPermission(err) {
 				return errors.New("could not install completions due to permissions - rerun this command with sudo")
 			}
-			return fmt.Errorf("could not install completions: %v", err)
+			return errors.Wrapf(err, "could not install completions")
 		}
 
 		defer func() {

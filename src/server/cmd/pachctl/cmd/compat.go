@@ -9,6 +9,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	pfspretty "github.com/pachyderm/pachyderm/src/server/pfs/pretty"
 	"github.com/pachyderm/pachyderm/src/server/pkg/cmdutil"
@@ -293,7 +294,10 @@ $ pachctl put-file repo branch path -f http://host/path
 # Put the data from a URL as repo/branch/path:
 $ pachctl put-file repo branch -f http://host/path
 
-# Put the data from an S3 bucket as repo/branch/s3_object:
+# Put the data from an S3 bucket as repo/branch/s3_object.
+# Do not specify the cloud endpoint in the path. For example,
+# if your endpoint is 'test.data.example.org' and your bucket
+# name is 'test-bucket', then the path to your bucket is 's3://test-bucket'.
 $ pachctl put-file repo branch -r -f s3://my_bucket
 
 # Put several files or URLs that are listed in file.
@@ -424,7 +428,7 @@ $ pachctl diff-file foo master path1 bar master path2`,
 			hasRepo := len(parts) > 0 && parts[0] != ""
 			hasCommit := len(parts) == 2 && parts[1] != ""
 			if hasCommit && !hasRepo {
-				return nil, fmt.Errorf("invalid commit id \"%s\": repo cannot be empty", arg)
+				return nil, errors.Errorf("invalid commit id \"%s\": repo cannot be empty", arg)
 			}
 			commit := &pfs.Commit{
 				Repo: &pfs.Repo{
@@ -600,7 +604,7 @@ Provenance: {{range .Provenance}} {{.Repo.Name}}/{{.ID}}{{end}}{{end}}
 				return err
 			}
 			if commitInfo == nil {
-				return fmt.Errorf("commit %s not found", args[1])
+				return errors.Errorf("commit %s not found", args[1])
 			}
 			if raw {
 				marshaller := &jsonpb.Marshaler{Indent: "  "}

@@ -2,6 +2,7 @@ package grpcutil
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"fmt"
 	"math"
 	"net"
@@ -10,8 +11,11 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	// Import registers the grpc GZIP decoder
+	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tls"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
 	log "github.com/sirupsen/logrus"
@@ -45,17 +49,20 @@ func NewServer(ctx context.Context, publicPortTLSAllowed bool) (*Server, error) 
 		grpc.StreamInterceptor(tracing.StreamServerInterceptor()),
 	}
 
+	var cLoader *tls.CertLoader
 	if publicPortTLSAllowed {
 		// Validate environment
 		certPath, keyPath, err := tls.GetCertPaths()
 		if err != nil {
 			log.Warnf("TLS disabled: %v", err)
 		} else {
+			cLoader = tls.NewCertLoader(certPath, keyPath, tls.CertCheckFrequency)
 			// Read TLS cert and key
-			transportCreds, err := credentials.NewServerTLSFromFile(certPath, keyPath)
+			err := cLoader.LoadAndStart()
 			if err != nil {
-				return nil, fmt.Errorf("couldn't build transport creds: %v", err)
+				return nil, errors.Wrapf(err, "couldn't build transport creds: %v", err)
 			}
+			transportCreds := credentials.NewTLS(&gotls.Config{GetCertificate: cLoader.GetCertificate})
 			opts = append(opts, grpc.Creds(transportCreds))
 		}
 	}
@@ -66,6 +73,9 @@ func NewServer(ctx context.Context, publicPortTLSAllowed bool) (*Server, error) 
 	eg.Go(func() error {
 		<-ctx.Done()
 		server.GracefulStop() // This also closes the listeners
+		if cLoader != nil {
+			cLoader.Stop()
+		}
 		return nil
 	})
 

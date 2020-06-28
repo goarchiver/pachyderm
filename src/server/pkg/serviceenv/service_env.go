@@ -1,23 +1,22 @@
 package serviceenv
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"net"
 	"os"
 	"time"
 
-	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/pachyderm/pachyderm/src/client"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
-	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	kube "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
+	etcd "github.com/coreos/etcd/clientv3"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
+	kube "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // ServiceEnv is a struct containing connections to other services in the
@@ -99,7 +98,7 @@ func (env *ServiceEnv) initPachClient() error {
 		var err error
 		env.pachClient, err = client.NewFromAddress(env.pachAddress)
 		if err != nil {
-			return fmt.Errorf("failed to initialize pach client: %v", err)
+			return errors.Wrapf(err, "failed to initialize pach client")
 		}
 		return nil
 	}, backoff.RetryEvery(time.Second).For(5*time.Minute))
@@ -117,12 +116,13 @@ func (env *ServiceEnv) initEtcdClient() error {
 			Endpoints: []string{env.etcdAddress},
 			// Use a long timeout with Etcd so that Pachyderm doesn't crash loop
 			// while waiting for etcd to come up (makes startup net faster)
-			DialOptions:        append(client.DefaultDialOptions(), grpc.WithTimeout(3*time.Minute)), //lint:ignore SA1019 can't call grpc.Dial directly
+			DialTimeout:        3 * time.Minute,
+			DialOptions:        client.DefaultDialOptions(), //lint:ignore SA1019 can't call grpc.Dial directly
 			MaxCallSendMsgSize: math.MaxInt32,
 			MaxCallRecvMsgSize: math.MaxInt32,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to initialize etcd client: %v", err)
+			return errors.Wrapf(err, "failed to initialize etcd client")
 		}
 		return nil
 	}, backoff.RetryEvery(time.Second).For(5*time.Minute))
@@ -139,7 +139,7 @@ func (env *ServiceEnv) initKubeClient() error {
 			log.Errorf("falling back to insecure kube client due to error from NewInCluster: %s", err)
 			kubeAddr, ok = os.LookupEnv("KUBERNETES_PORT_443_TCP_ADDR")
 			if !ok {
-				return fmt.Errorf("can't fall back to insecure kube client due to missing env var (failed to retrieve in-cluster config: %v)", err)
+				return errors.Wrapf(err, "can't fall back to insecure kube client due to missing env var (failed to retrieve in-cluster config")
 			}
 			cfg = &rest.Config{
 				Host: fmt.Sprintf("%s:443", kubeAddr),
@@ -150,7 +150,7 @@ func (env *ServiceEnv) initKubeClient() error {
 		}
 		env.kubeClient, err = kube.NewForConfig(cfg)
 		if err != nil {
-			return fmt.Errorf("could not initialize kube client: %v", err)
+			return errors.Wrapf(err, "could not initialize kube client")
 		}
 		return nil
 	}, backoff.RetryEvery(time.Second).For(5*time.Minute))

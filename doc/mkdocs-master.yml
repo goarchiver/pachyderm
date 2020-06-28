@@ -1,6 +1,6 @@
 site_name: Pachyderm Documentation
-site_description: Pachyderm Documention
-site_author: Pachyderm Team
+site_description: A Pachyderm documentation website that provides information on how to use Pachyderm data version control products.
+site_author: Pachyderm
 site_url: https://docs.pachyderm.com/
 docs_dir: docs/master/
 site_dir: site/master/
@@ -10,12 +10,12 @@ repo_url: https://github.com/pachyderm/pachyderm
 edit_uri: ""
 
 # Copyright
-copyright: 'Copyright Pachyderm Inc, 2019'
+copyright: 'Copyright Pachyderm Inc, 2020'
 
 # Configuration
 theme:
-  name: null
-  custom_dir: material
+  name: pachydermdocs
+  custom_dir: overrides
 
   # 404 page
   static_templates:
@@ -57,11 +57,14 @@ extra:
 
 extra_css:
     - 'assets/stylesheets/extra.css'
+extra_javascript:
+    - 'assets/javascripts/extra.js'
 
 # Extensions
 markdown_extensions:
   - markdown.extensions.admonition
   - markdown.extensions.tables
+  - markdown.extensions.attr_list
   - markdown.extensions.codehilite:
       guess_lang: false
   - markdown.extensions.def_list
@@ -78,13 +81,14 @@ markdown_extensions:
   - pymdownx.critic
   - pymdownx.details
   - pymdownx.emoji:
-      emoji_generator: !!python/name:pymdownx.emoji.to_svg
+      emoji_generator: !!python/name:pymdownx.emoji.to_svg  
   - pymdownx.inlinehilite
   - pymdownx.keys
   - pymdownx.magiclink
   - pymdownx.mark
   - pymdownx.smartsymbols
   - pymdownx.superfences
+  - pymdownx.tabbed
   - pymdownx.tasklist:
       custom_checkbox: true
   - pymdownx.tilde
@@ -145,14 +149,16 @@ nav:
             - Splitting Data for Distributed Processing: how-tos/splitting-data/splitting.md
             - Adjusting Data Processing by Splitting Data: how-tos/splitting-data/adjusting_data_processing_w_split.md
         - Create a Machine Learning Workflow: how-tos/create-ml-workflow.md
-        - Use JupyterHub:
-            - Overview: how-tos/use-jupyterhub/index.md
-            - Using python-pachyderm in JupyterHub: how-tos/use-jupyterhub/using-jupyterhub.md
+        - Use Pachyderm IDE:
+            - Overview: how-tos/use-pachyderm-ide/index.md
+            - Using the Pachyderm IDE with python-pachyderm: how-tos/use-pachyderm-ide/using-pachyderm-ide.md
+        - Mount a Volume: how-tos/mount-volume.md
         - Pipeline Operations:
             - Create a Pipeline: how-tos/create-pipeline.md
             - Run a Pipeline on a Specific Commit: how-tos/run_pipeline.md
             - Update a Pipeline: how-tos/updating_pipelines.md
             - Delete a Pipeline: how-tos/delete-pipeline.md
+            - Monitor Job Progress: how-tos/monitor-job-progress.md
         - Processing Time-Windowed Data: how-tos/time_windows.md
         - Use Transactions: how-tos/use-transactions-to-run-multiple-commands.md
         - Delete Data: how-tos/removing_data_from_pachyderm.md
@@ -173,7 +179,7 @@ nav:
             - Deploy on Azure: deploy-manage/deploy/azure.md
             - Deploy on OpenShift: deploy-manage/deploy/openshift.md
             - Deploy On-Premises: deploy-manage/deploy/on_premises.md
-            - Deploy Pachyderm with JupyterHub: deploy-manage/deploy/deploy-pachyderm-jupyterhub.md
+            - Deploy Pachyderm IDE: deploy-manage/deploy/deploy-pachyderm-ide.md
             - Create a Custom Deployment:
                 - Overview: deploy-manage/deploy/deploy_custom/index.md
                 - Before You Begin: deploy-manage/deploy/deploy_custom/deploy_custom_before_you_begin.md
@@ -194,6 +200,9 @@ nav:
         - Manage Pachyderm:
             - Overview: deploy-manage/manage/index.md
             - Manage Cluster Access: deploy-manage/manage/cluster-access.md
+            - Configure External Access:
+                - Overview: deploy-manage/manage/configure-external-access.md
+                - deploy-manage/manage/expose-pach-ui-ingress.md 
             - Using Pachctl Shell: deploy-manage/manage/pachctl_shell.md
             - Autoscale your Cluster: deploy-manage/manage/autoscaling.md
             - Backup and Restore: deploy-manage/manage/backup_restore.md
@@ -205,7 +214,12 @@ nav:
                 - Migrate to a Major Version: deploy-manage/manage/migrations.md
                 - Upgrade your Cluster: deploy-manage/manage/upgrades.md
             - Disable Usage Metrics: deploy-manage/manage/disable-metrics.md
-            - Using the S3 Gateway: how-tos/s3gateway.md
+            - Using the S3 Gateway:
+                - Overview: deploy-manage/manage/s3gateway/index.md
+                - Configure the S3 Gateway: deploy-manage/manage/s3gateway/configure-s3client.md
+                - Create an S3-enabled Pipeline: deploy-manage/manage/s3gateway/deploy-s3gateway-sidecar.md
+                - Supported Operations: deploy-manage/manage/s3gateway/supported-operations.md
+                - Unsupported Operations: deploy-manage/manage/s3gateway/unsupported-operations.md
     - Reference:
         - Overview: reference/index.md
         - Pipeline Specification: reference/pipeline_spec.md
@@ -376,6 +390,6 @@ nav:
         - Pipeline Troubleshooting: troubleshooting/pipeline_troubleshooting.md
 
 # Google Analytics
-google_analytics:
-  - !!python/object/apply:os.getenv ["UA-158483597-1"]
-  - autosite_name: Pachyderm Documentation
+#google_analytics:
+#  - !!python/object/apply:os.getenv ["UA-158483597-1"]
+#  - auto

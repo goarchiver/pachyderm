@@ -7,6 +7,8 @@ import (
 	"runtime/debug"
 	"testing"
 	"time"
+
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 )
 
 // Matches checks that a string matches a regular-expression.
@@ -89,17 +91,17 @@ func ElementsEqualOrErr(expecteds interface{}, actuals interface{}) error {
 	if esIsEmpty && asIsEmpty {
 		return nil
 	} else if esIsEmpty {
-		return fmt.Errorf("expected 0 elements, but got %d: %v", as.Len(), actuals)
+		return errors.Errorf("expected 0 elements, but got %d: %v", as.Len(), actuals)
 	} else if asIsEmpty {
-		return fmt.Errorf("expected %d elements, but got 0\n  expected: %v", es.Len(), expecteds)
+		return errors.Errorf("expected %d elements, but got 0\n  expected: %v", es.Len(), expecteds)
 	}
 
 	// Both slices are nonempty--compare elements
 	if es.Kind() != reflect.Slice {
-		return fmt.Errorf("\"expecteds\" must be a slice, but was %s", es.Type().String())
+		return errors.Errorf("\"expecteds\" must be a slice, but was %s", es.Type().String())
 	}
 	if as.Kind() != reflect.Slice {
-		return fmt.Errorf("\"actuals\" must be a slice, but was %s", as.Type().String())
+		return errors.Errorf("\"actuals\" must be a slice, but was %s", as.Type().String())
 	}
 
 	// Make sure expecteds and actuals are slices of the same type, modulo
@@ -114,7 +116,13 @@ func ElementsEqualOrErr(expecteds interface{}, actuals interface{}) error {
 		asElemType = as.Type().Elem().Elem()
 	}
 	if esElemType != asElemType {
-		return fmt.Errorf("expected []%s but got []%s", es.Type().Elem(), as.Type().Elem())
+		return errors.Errorf("expected []%s but got []%s", es.Type().Elem(), as.Type().Elem())
+	}
+
+	if es.Len() != as.Len() {
+		// slight abuse of error: contains newlines so final output prints well
+		return errors.Errorf("expected %d elements, but got %d\n  expected: %v\n  actual: %v",
+			es.Len(), as.Len(), expecteds, actuals)
 	}
 
 	// Count up elements of expecteds
@@ -147,10 +155,6 @@ func ElementsEqualOrErr(expecteds interface{}, actuals interface{}) error {
 			actualCt.SetMapIndex(v, reflect.ValueOf(newCt))
 		}
 	}
-	if expectedCt.Len() != actualCt.Len() {
-		// slight abuse of error: contains newlines so final output prints well
-		return fmt.Errorf("expected %d distinct elements, but got %d\n  expected: %v\n  actual: %v", expectedCt.Len(), actualCt.Len(), expecteds, actuals)
-	}
 	for _, key := range expectedCt.MapKeys() {
 		ec := expectedCt.MapIndex(key)
 		ac := actualCt.MapIndex(key)
@@ -163,18 +167,95 @@ func ElementsEqualOrErr(expecteds interface{}, actuals interface{}) error {
 				acInt = ac.Int()
 			}
 			// slight abuse of error: contains newlines so final output prints well
-			return fmt.Errorf("expected %d copies of %v, but got %d copies\n  expected: %v\n  actual: %v", ecInt, key, acInt, expecteds, actuals)
+			return errors.Errorf("expected %d copies of %v, but got %d copies\n  expected: %v\n  actual: %v", ecInt, key, acInt, expecteds, actuals)
 		}
 	}
 	return nil
 }
 
+// ImagesEqual is similar to 'ElementsEqualUnderFn', but it applies 'f' to both
+// 'expecteds' and 'actuals'. This is useful for doing before/after
+// comparisons. This can also compare 'T' and '*T' , but 'f' should expect
+// interfaces wrapping the underlying types of 'expecteds' (e.g. if 'expecteds'
+// has type []*T and 'actuals' has type []T, then 'f' should cast its argument
+// to '*T')
+//
+// Like ElementsEqual, treat 'nil' and the empty slice as equivalent (for
+// convenience)
+func ImagesEqual(tb testing.TB, expecteds interface{}, actuals interface{}, f func(interface{}) interface{}, msgAndArgs ...interface{}) {
+	tb.Helper()
+	as := reflect.ValueOf(actuals)
+	es := reflect.ValueOf(expecteds)
+
+	// Check if 'actuals' is empty; if so, just pass nil (no need to transform)
+	if actuals != nil && !as.IsNil() && as.Kind() != reflect.Slice {
+		fatal(tb, msgAndArgs, fmt.Sprintf("\"actuals\" must be a slice, but was %s", as.Type().String()))
+	} else if actuals == nil || as.IsNil() || as.Len() == 0 {
+		// Just pass 'nil' for 'actuals'
+		if err := ElementsEqualOrErr(expecteds, nil); err != nil {
+			fatal(tb, msgAndArgs, err.Error())
+		}
+		return
+	}
+
+	// Check if 'expecteds' is empty: if so, return an error (since 'actuals' is
+	// not empty)
+	if expecteds != nil && !es.IsNil() && es.Kind() != reflect.Slice {
+		fatal(tb, msgAndArgs, fmt.Sprintf("\"expecteds\" must be a slice, but was %s", as.Type().String()))
+	} else if expecteds == nil || es.IsNil() || es.Len() == 0 {
+		fatal(tb, msgAndArgs, fmt.Sprintf("expected 0 distinct elements, but got %d\n elements (before function is applied): %v", as.Len(), actuals))
+	}
+
+	// Make sure expecteds and actuals are slices of the same type, modulo
+	// pointers (*T ~= T in this function). This is better than some kind of
+	// opaque reflection error from calling 'f' on mismatched types.
+	esArePtrs := es.Type().Elem().Kind() == reflect.Ptr
+	asArePtrs := as.Type().Elem().Kind() == reflect.Ptr
+	esUnderlyingType, asUnderlyingType := es.Type().Elem(), as.Type().Elem()
+	if esArePtrs {
+		esUnderlyingType = es.Type().Elem().Elem()
+	}
+	if asArePtrs {
+		asUnderlyingType = as.Type().Elem().Elem()
+	}
+	if esUnderlyingType != asUnderlyingType {
+		fatal(tb, msgAndArgs, "expected []%s but got []%s", esUnderlyingType, asUnderlyingType)
+	}
+
+	if es.Len() != as.Len() {
+		// slight abuse of error: contains newlines so final output prints well
+		fatal(tb, msgAndArgs, "expected %d elements, but got %d\n  expected: %v\n  actual: %v",
+			es.Len(), as.Len(), expecteds, actuals)
+	}
+
+	// apply 'f' to both 'es' and 'as'. Make 'es[i]' have the same underlying
+	// type as 'as[i]' (may need to take address or dereference elements) so 'f'
+	// can apply to both.
+	newExpecteds, newActuals := make([]interface{}, 0, as.Len()), make([]interface{}, 0, as.Len())
+	for i := 0; i < es.Len(); i++ {
+		switch {
+		case asArePtrs && !esArePtrs:
+			newExpecteds = append(newExpecteds, f(es.Index(i).Addr().Interface()))
+		case !asArePtrs && esArePtrs:
+			newExpecteds = append(newExpecteds, f(es.Index(i).Elem().Interface()))
+		default:
+			newExpecteds = append(newExpecteds, f(es.Index(i).Interface()))
+		}
+	}
+	for i := 0; i < as.Len(); i++ {
+		newActuals = append(newActuals, f(as.Index(i).Interface()))
+	}
+	if err := ElementsEqualOrErr(newExpecteds, newActuals); err != nil {
+		fatal(tb, msgAndArgs, err.Error())
+	}
+}
+
 // ElementsEqualUnderFn checks that the elements of the slice 'expecteds' are
-// exactly the images of every element of the slice 'actuals' under 'f',
-// ignoring order (i.e.  'expecteds' and 'map(f, actuals)' are setwise-equal,
-// but respecting duplicates). This is useful for cases where ElementsEqual
-// doesn't quite work, e.g. because the type in 'expecteds'/'actuals' contains a
-// pointer, or 'actuals' contains superfluous data which you wish to discard
+// the same as the elements of the slice 'actuals' under 'f', ignoring order
+// (i.e.  'expecteds' and 'map(f, actuals)' are setwise-equal, but respecting
+// duplicates). This is useful for cases where ElementsEqual doesn't quite work,
+// e.g. because the type in 'expecteds'/'actuals' contains a pointer, or
+// 'actuals' contains superfluous data which you wish to discard.
 //
 // Like ElementsEqual, treat 'nil' and the empty slice as equivalent (for
 // convenience)
@@ -239,7 +320,7 @@ func oneOfEquals(sliceName string, slice interface{}, elem interface{}) (bool, e
 		sl = reflect.MakeSlice(reflect.SliceOf(e.Type()), 0, 0)
 	}
 	if sl.Kind() != reflect.Slice {
-		return false, fmt.Errorf("\"%s\" must a be a slice, but instead was %s", sliceName, sl.Type().String())
+		return false, errors.Errorf("\"%s\" must a be a slice, but instead was %s", sliceName, sl.Type().String())
 	}
 	if e.Type() != sl.Type().Elem() {
 		return false, nil
@@ -307,7 +388,7 @@ func NoneEquals(tb testing.TB, expected interface{}, actuals interface{}, msgAnd
 func NoError(tb testing.TB, err error, msgAndArgs ...interface{}) {
 	tb.Helper()
 	if err != nil {
-		fatal(tb, msgAndArgs, "No error is expected but got %s", err.Error())
+		fatal(tb, msgAndArgs, "No error is expected but got %v", err)
 	}
 }
 
@@ -324,7 +405,7 @@ func NoErrorWithinT(tb testing.TB, t time.Duration, f func() error, msgAndArgs .
 	select {
 	case err := <-errCh:
 		if err != nil {
-			fatal(tb, msgAndArgs, "No error is expected but got %s", err.Error())
+			fatal(tb, msgAndArgs, "No error is expected but got %v", err)
 		}
 	case <-time.After(t):
 		fatal(tb, msgAndArgs, "operation did not finish within %s", t.String())
@@ -439,5 +520,13 @@ func fatal(tb testing.TB, userMsgAndArgs []interface{}, msgFmt string, msgArgs .
 	tb.Helper()
 	logMessage(tb, userMsgAndArgs)
 	tb.Logf(msgFmt, msgArgs...)
+	if len(msgArgs) > 0 {
+		err, ok := msgArgs[0].(error)
+		if ok {
+			errors.ForEachStackFrame(err, func(frame errors.Frame) {
+				tb.Logf("%+v\n", frame)
+			})
+		}
+	}
 	tb.Fatalf("current stack:\n%s", string(debug.Stack()))
 }

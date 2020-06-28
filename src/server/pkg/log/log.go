@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fatih/camelcase"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 )
@@ -49,7 +50,7 @@ func NewLocalLogger(service string) Logger {
 }
 
 func newLogger(service string, exportStats bool) Logger {
-	l := logrus.New()
+	l := logrus.StandardLogger()
 	l.Formatter = FormatterFunc(Pretty)
 	newLogger := &logger{
 		l.WithFields(logrus.Fields{"service": service}),
@@ -193,20 +194,7 @@ func (l *logger) ReportMetric(method string, duration time.Duration, err error) 
 }
 
 func (l *logger) LogAtLevel(entry *logrus.Entry, level logrus.Level, args ...interface{}) {
-	switch level {
-	case logrus.PanicLevel:
-		entry.Panic(args)
-	case logrus.FatalLevel:
-		entry.Fatal(args)
-	case logrus.ErrorLevel:
-		entry.Error(args)
-	case logrus.WarnLevel:
-		entry.Warn(args)
-	case logrus.InfoLevel:
-		entry.Info(args)
-	case logrus.DebugLevel:
-		entry.Debug(args)
-	}
+	entry.Log(level, args)
 }
 
 func (l *logger) LogAtLevelFromDepth(request interface{}, response interface{}, err error, duration time.Duration, level logrus.Level, depth int) {
@@ -234,6 +222,11 @@ func (l *logger) LogAtLevelFromDepth(request interface{}, response interface{}, 
 	if err != nil {
 		// "err" itself might be a code or even an empty struct
 		fields["error"] = err.Error()
+		var frames []string
+		errors.ForEachStackFrame(err, func(frame errors.Frame) {
+			frames = append(frames, fmt.Sprintf("%+v", frame))
+		})
+		fields["stack"] = frames
 	}
 	if duration > 0 {
 		fields["duration"] = duration
@@ -268,20 +261,20 @@ func Pretty(entry *logrus.Entry) ([]byte, error) {
 			strings.ToUpper(entry.Level.String()),
 		),
 	)
-	if entry.Data["service"] != nil {
+	if entry.Data["service"] != nil && entry.Data["method"] != nil {
 		serialized = append(serialized, []byte(fmt.Sprintf("%v.%v ", entry.Data["service"], entry.Data["method"]))...)
-	}
-	if len(entry.Data) > 2 {
 		delete(entry.Data, "service")
 		delete(entry.Data, "method")
+	}
+	if len(entry.Data) > 0 {
 		if entry.Data["duration"] != nil {
 			entry.Data["duration"] = entry.Data["duration"].(time.Duration).Seconds()
 		}
 		data, err := json.Marshal(entry.Data)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal fields to JSON, %v", err)
+			return nil, errors.Wrapf(err, "failed to marshal fields to JSON")
 		}
-		serialized = append(serialized, []byte(string(data))...)
+		serialized = append(serialized, data...)
 		serialized = append(serialized, ' ')
 	}
 

@@ -2,12 +2,14 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
 	"github.com/pachyderm/pachyderm/src/server/pkg/hashtree"
@@ -18,6 +20,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
+
+var _ APIServer = &apiServer{}
 
 // apiServer implements the public interface of the Pachyderm File System,
 // including all RPCs defined in the protobuf spec.  Implementation details
@@ -167,9 +171,6 @@ func (a *apiServer) StartCommitInTransaction(
 	if commit != nil {
 		id = commit.ID
 	}
-	if a.env.NewStorageLayer {
-		return a.driver.startCommitNewStorageLayer(txnCtx, id, request.Parent, request.Branch, request.Provenance, request.Description)
-	}
 	return a.driver.startCommit(txnCtx, id, request.Parent, request.Branch, request.Provenance, request.Description)
 }
 
@@ -194,7 +195,24 @@ func (a *apiServer) BuildCommit(ctx context.Context, request *pfs.BuildCommitReq
 	func() { a.Log(request, nil, nil, 0) }()
 	defer func(start time.Time) { a.Log(request, response, retErr, time.Since(start)) }(time.Now())
 
-	commit, err := a.driver.buildCommit(ctx, request.ID, request.Parent, request.Branch, request.Provenance, request.Tree, request.Trees, request.Datums, request.SizeBytes)
+	var err error
+	var started, finished time.Time
+	if request.Started != nil {
+		started, err = types.TimestampFromProto(request.Started)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse timestamp %q: %v",
+				types.TimestampString(request.Started), err)
+		}
+	}
+	if request.Finished != nil {
+		finished, err = types.TimestampFromProto(request.Finished)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse timestamp %q: %v",
+				types.TimestampString(request.Finished), err)
+		}
+	}
+
+	commit, err := a.driver.buildCommit(ctx, request.ID, request.Parent, request.Branch, request.Provenance, request.Tree, request.Trees, request.Datums, started, finished, request.SizeBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -207,9 +225,6 @@ func (a *apiServer) FinishCommitInTransaction(
 	txnCtx *txnenv.TransactionContext,
 	request *pfs.FinishCommitRequest,
 ) error {
-	if a.env.NewStorageLayer {
-		return a.driver.finishCommitNewStorageLayer(txnCtx, request.Commit, request.Description)
-	}
 	if request.Trees != nil {
 		return a.driver.finishOutputCommit(txnCtx, request.Commit, request.Trees, request.Datums, request.SizeBytes)
 	}
@@ -378,11 +393,14 @@ func (a *apiServer) SubscribeCommit(request *pfs.SubscribeCommitRequest, stream 
 func (a *apiServer) PutFile(putFileServer pfs.API_PutFileServer) (retErr error) {
 	s := newPutFileServer(putFileServer)
 	r, err := s.Peek()
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
-	request := *r
-	request.Value = nil
+	var request pfs.PutFileRequest
+	if r != nil {
+		request := *r
+		request.Value = nil
+	}
 	func() { a.Log(request, nil, nil, 0) }()
 	defer func(start time.Time) { a.Log(request, nil, retErr, time.Since(start)) }(time.Now())
 	defer drainFileServer(putFileServer)
@@ -575,6 +593,34 @@ func (a *apiServer) DeleteAll(ctx context.Context, request *types.Empty) (respon
 		return nil, err
 	}
 	return &types.Empty{}, nil
+}
+
+// V2 Methods
+var errV2NotImplemented = errors.Errorf("v2 method not implemented")
+
+// GetTarV2 not implemented by v1 apiServer
+func (a *apiServer) GetTarV2(request *pfs.GetTarRequestV2, server pfs.API_GetTarV2Server) (retErr error) {
+	return errV2NotImplemented
+}
+
+// GetTarConditionalV2 not implemented by v1 apiServer
+func (a *apiServer) GetTarConditionalV2(server pfs.API_GetTarConditionalV2Server) (retErr error) {
+	return errV2NotImplemented
+}
+
+// FileOperationV2 not implemented by v1 apiServer
+func (a *apiServer) FileOperationV2(server pfs.API_FileOperationV2Server) error {
+	return errV2NotImplemented
+}
+
+// ListFileV2 not implemented by v1 apiServer
+func (a *apiServer) ListFileV2(req *pfs.ListFileRequest, server pfs.API_ListFileV2Server) error {
+	return errV2NotImplemented
+}
+
+// GlobFileV2 not implemented
+func (a *apiServer) GlobFileV2(req *pfs.GlobFileRequest, server pfs.API_GlobFileV2Server) error {
+	return errV2NotImplemented
 }
 
 func drainFileServer(putFileServer interface {

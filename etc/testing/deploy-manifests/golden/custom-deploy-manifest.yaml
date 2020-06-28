@@ -8,6 +8,16 @@ metadata:
   name: pachyderm
   namespace: pachyderm
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  creationTimestamp: null
+  labels:
+    app: ""
+    suite: pachyderm
+  name: pachyderm-worker
+  namespace: pachyderm
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -70,6 +80,45 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: pachyderm
+  namespace: pachyderm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  creationTimestamp: null
+  labels:
+    app: ""
+    suite: pachyderm
+  name: pachyderm-worker
+  namespace: pachyderm
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - update
+  - create
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  creationTimestamp: null
+  labels:
+    app: ""
+    suite: pachyderm
+  name: pachyderm-worker
+  namespace: pachyderm
+roleRef:
+  apiGroup: ""
+  kind: Role
+  name: pachyderm-worker
+subjects:
+- kind: ServiceAccount
+  name: pachyderm-worker
   namespace: pachyderm
 ---
 apiVersion: v1
@@ -136,7 +185,7 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: metadata.namespace
-        image: quay.io/coreos/etcd:v3.3.5
+        image: pachyderm/etcd:v3.3.5
         imagePullPolicy: IfNotPresent
         name: etcd
         ports:
@@ -280,7 +329,9 @@ spec:
       namespace: pachyderm
     spec:
       containers:
-      - env:
+      - command:
+        - /pachd
+        env:
         - name: PACH_ROOT
           value: /pach
         - name: ETCD_PREFIX
@@ -290,14 +341,14 @@ spec:
           value: AMAZON
         - name: STORAGE_HOST_PATH
         - name: WORKER_IMAGE
-          value: pachyderm/worker:1.9.12
+          value: pachyderm/worker:1.11.0
         - name: IMAGE_PULL_SECRET
         - name: WORKER_SIDECAR_IMAGE
-          value: pachyderm/pachd:1.9.12
+          value: pachyderm/pachd:1.11.0
         - name: WORKER_IMAGE_PULL_POLICY
           value: IfNotPresent
         - name: PACHD_VERSION
-          value: 1.9.12
+          value: 1.11.0
         - name: METRICS
           value: "true"
         - name: LOG_LEVEL
@@ -309,7 +360,7 @@ spec:
           value: "true"
         - name: PACHYDERM_AUTHENTICATION_DISABLED_FOR_TESTING
           value: "false"
-        - name: PACHD_POD_NAMESPACE
+        - name: PACH_NAMESPACE
           valueFrom:
             fieldRef:
               apiVersion: v1
@@ -502,7 +553,9 @@ spec:
               optional: true
         - name: STORAGE_UPLOAD_CONCURRENCY_LIMIT
           value: "100"
-        image: pachyderm/pachd:1.9.12
+        - name: STORAGE_PUT_FILE_CONCURRENCY_LIMIT
+          value: "100"
+        image: pachyderm/pachd:1.11.0
         imagePullPolicy: IfNotPresent
         name: pachd
         ports:
@@ -599,7 +652,7 @@ spec:
       namespace: pachyderm
     spec:
       containers:
-      - image: pachyderm/dash:1.9.0
+      - image: pachyderm/dash:0.5.48
         imagePullPolicy: IfNotPresent
         name: dash
         ports:

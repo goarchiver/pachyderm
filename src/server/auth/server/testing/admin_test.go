@@ -6,25 +6,25 @@ package server
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/types"
-	"golang.org/x/net/context"
-
 	"github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/auth"
 	"github.com/pachyderm/pachyderm/src/client/enterprise"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
+	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/require"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	"github.com/pachyderm/pachyderm/src/client/version"
 	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
 	tu "github.com/pachyderm/pachyderm/src/server/pkg/testutil"
+
+	"github.com/gogo/protobuf/types"
+	"golang.org/x/net/context"
 )
 
 const secsInYear = 365 * 24 * 60 * 60
@@ -550,7 +550,7 @@ func TestExpirationRepoOnlyAccessibleToAdmins(t *testing.T) {
 	// Make current enterprise token expire
 	adminClient.Enterprise.Activate(adminClient.Ctx(),
 		&enterprise.ActivateRequest{
-			ActivationCode: tu.GetTestEnterpriseCode(),
+			ActivationCode: tu.GetTestEnterpriseCode(t),
 			Expires:        TSProtoOrDie(t, time.Now().Add(-30*time.Second)),
 		})
 	// wait for Enterprise token to expire
@@ -623,7 +623,7 @@ func TestExpirationRepoOnlyAccessibleToAdmins(t *testing.T) {
 	year := 365 * 24 * time.Hour
 	adminClient.Enterprise.Activate(adminClient.Ctx(),
 		&enterprise.ActivateRequest{
-			ActivationCode: tu.GetTestEnterpriseCode(),
+			ActivationCode: tu.GetTestEnterpriseCode(t),
 			// This will stop working some time in 2026
 			Expires: TSProtoOrDie(t, time.Now().Add(year)),
 		})
@@ -722,7 +722,7 @@ func TestPipelinesRunAfterExpiration(t *testing.T) {
 	// Make current enterprise token expire
 	adminClient.Enterprise.Activate(adminClient.Ctx(),
 		&enterprise.ActivateRequest{
-			ActivationCode: tu.GetTestEnterpriseCode(),
+			ActivationCode: tu.GetTestEnterpriseCode(t),
 			Expires:        TSProtoOrDie(t, time.Now().Add(-30*time.Second)),
 		})
 	// wait for Enterprise token to expire
@@ -776,7 +776,7 @@ func TestGetSetScopeAndAclWithExpiredToken(t *testing.T) {
 	// Make current enterprise token expire
 	adminClient.Enterprise.Activate(adminClient.Ctx(),
 		&enterprise.ActivateRequest{
-			ActivationCode: tu.GetTestEnterpriseCode(),
+			ActivationCode: tu.GetTestEnterpriseCode(t),
 			Expires:        TSProtoOrDie(t, time.Now().Add(-30*time.Second)),
 		})
 	// wait for Enterprise token to expire
@@ -1070,7 +1070,7 @@ func TestGetIndefiniteAuthToken(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, robotUser, who.Username)
 	require.False(t, who.IsAdmin)
-	require.Equal(t, -1, who.TTL)
+	require.Equal(t, int64(-1), who.TTL)
 }
 
 // TestRobotUserWhoAmI tests that robot users can call WhoAmI and get a response
@@ -1437,6 +1437,9 @@ func TestActivateAsRobotUser(t *testing.T) {
 	deleteAll(t)
 	defer deleteAll(t)
 
+	// Activate Pachyderm Enterprise (if it's not already active)
+	require.NoError(t, tu.ActivateEnterprise(t, seedClient))
+
 	client := seedClient.WithCtx(context.Background())
 	resp, err := client.Activate(client.Ctx(), &auth.ActivateRequest{
 		Subject: robot("deckard"),
@@ -1465,6 +1468,9 @@ func TestActivateMismatchedUsernames(t *testing.T) {
 	}
 	deleteAll(t)
 	defer deleteAll(t)
+
+	// Activate Pachyderm Enterprise (if it's not already active)
+	require.NoError(t, tu.ActivateEnterprise(t, seedClient))
 
 	client := seedClient.WithCtx(context.Background())
 	_, err := client.Activate(client.Ctx(), &auth.ActivateRequest{
@@ -1595,7 +1601,7 @@ func TestDeleteRCInStandby(t *testing.T) {
 			return err
 		}
 		if pi.State != pps.PipelineState_PIPELINE_STANDBY {
-			return fmt.Errorf("pipeline should be in standby, but is in %s", pi.State.String())
+			return errors.Errorf("pipeline should be in standby, but is in %s", pi.State.String())
 		}
 		return nil
 	})
@@ -1676,7 +1682,7 @@ func TestNoOutputRepoDoesntCrashPPSMaster(t *testing.T) {
 			return err
 		}
 		if pi.State == pps.PipelineState_PIPELINE_FAILURE {
-			return fmt.Errorf("%q should be in state FAILURE but is in %q", pipeline, pi.State.String())
+			return errors.Errorf("%q should be in state FAILURE but is in %q", pipeline, pi.State.String())
 		}
 		return nil
 	})
@@ -1708,7 +1714,7 @@ func TestNoOutputRepoDoesntCrashPPSMaster(t *testing.T) {
 		if err == io.EOF {
 			return nil // expected--with no output repo, FlushCommit can't return anything
 		}
-		return fmt.Errorf("unexpected error value: %v", err)
+		return errors.Wrapf(err, "unexpected error value")
 	})
 
 	// Create a new pipeline, make sure FlushCommit eventually returns, and check

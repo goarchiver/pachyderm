@@ -1,7 +1,5 @@
 dist: xenial
 sudo: required
-services:
-  - docker
 cache:
   directories:
     # If any directories are added here, they must also be added to
@@ -34,15 +32,22 @@ env:
     - BUCKET=PPS5
     - BUCKET=PPS6
     - BUCKET=EXAMPLES
+
+stages:
+  - build
+  - test
+
+jobs:
+  include:
+    - stage: build
+      script: etc/testing/travis_build.sh
+
 before_install:
   # Make sure cache dirs exist and are writable
   - etc/testing/travis_cache.sh
 install:
   - etc/testing/travis_install.sh
-before_script:
-  - docker version
-script:
-  - etc/testing/travis.sh
+script: etc/testing/travis.sh
 before_cache:
   # Make sure cache dirs have the necessary permissions for Travis to traverse
   # & copy them all elsewhere

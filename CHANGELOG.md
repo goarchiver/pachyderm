@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.10.3
+
+- Fixes a bug that caused an EOF in `get file` request when using azure blob storage client (#4824)
+- Fixes a bug that created messages larger than expected size which can fail some operations with `grpc: received message larger than max` error (#4822)
+- Fixes a bug that would fail a restore operation in certain scenarios when the extract operation captures commits in certain failed/incomplete states (#4840)
+
+## 1.10.2
+
+- Changes to improve warning message (#4776)
+- Added support for metric endpoint configurable via METRICS_ENDPOINT env variable (#4793)
+- Fixes a bug that would not delete Kubernetes service when a pipeline is restarted due to updates (#4796)
+
+## 1.10.1
+
+- Changes to propagate feature flags to sidecar (#4719)
+- Changes to route all object store access through the sidecar (#4740)
+- Fixes a bug that prevented access to S3 gateway when other workers are running in a different namespace than Pachyderm namespace (#4752)
+- Fixes a bug that allowed to specific inputs with spouts (#4748)
+- Updates dash version to the latest published version 0.5.48 (#4758)
+
+
+## 1.10.0
+
+- Change Pachyderm license from Apache 2.0 to Pachyderm Community License
+- Changes to how resources are applied to pipeline containers (#4675)
+- Changes to GitHook and Prometheus ports (#4537)
+- Changes to handle S3 credentials passed to S3 gateway when Auth is disabled (#4585)
+- Changes to add support for ‘zsh’ shell (#4494)
+- Changes to allow only critical servers to startup with `--required-critical-servers-only` (#4536)
+- Changes to improve job logging (#4538)
+- Changes to support copying files from output repo to input repos (#4475)
+- Changes to ‘flush job’ CLI to support streaming output with --raw option (#4569)
+- Changes to remove cluster ID check (#4532)
+- Adds annotations and labels to top-level pipeline spec (#4608) (NOTE: If your pipeline spec specifies “service.annotations”, it is recommended that you follow the upgrade path and manually update the pipelines specs to include annotations under the new metadata tag)
+- Adds support for S3 inputs & outputs in pipeline specs (#4605, #4660)
+- New interactive Pachyderm Shell. The shell provides an easier way to interact with pachctl, including advanced auto-completion support (#4485, #4557)
+- Adds support for creating secrets through Pachyderm. (#4483)
+- Adds support for disabling commit progress indicator to reduce load on etcd (#4696)
+- Fixes a bug that ignored the EDITOR environment variable (#4672)
+- Fixes a bug that would cause restore failures from v1.8.x version to v1.9.x+ version (#4662)
+- Fixes a bug that would result in missing output data, under specific conditions, when a job resumes processing (#4656)
+- Fixes a bug that caused errors when specifying a branch name as the provenance of a new commit (#4657)
+- Fixes a bug that would leave a stats commit open under some failure conditions during run pipeline (#4637)
+- Fixes a bug that resulted in a stuck merge process when some commits are left in an unfinished state (#4595)
+- Fixes a bug that ignored the cron pipeline overwrite value when ‘run cron’ is called from the command line (#4517)
+- Fixes a bug that caused `edit pipeline` command to open an empty file (#4526)
+- Fixes a bug where some unfinished commit finish times displayed the Unix Epoch time. (#4539)
+- Fixes a family of bugs and edge conditions with spout marker (#4487)
+- Fixes a bug that would cause crash in ‘diff file’ command (#4601)
+- Fixes a bug that caused a crash when `run pipeline` is executed with stats enabled (#4615)
+- Fixes a bug that incorrectly skips duplicate datums in a union, under specific conditions (#4691)
+- Fixes a bug that ignored the logging level set in the environment variable (#4706) 
+
+
 ## 1.9.12
 
 - New configuration for deployments (exposed through pachctl deploy flags):

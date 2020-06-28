@@ -38,29 +38,30 @@ func NewAPIServer(
 	peerPort uint16,
 ) (APIServer, error) {
 	apiServer := &apiServer{
-		Logger:                log.NewLogger("pps.API"),
-		env:                   env,
-		txnEnv:                txnEnv,
-		etcdPrefix:            etcdPrefix,
-		namespace:             namespace,
-		workerImage:           workerImage,
-		workerSidecarImage:    workerSidecarImage,
-		workerImagePullPolicy: workerImagePullPolicy,
-		storageRoot:           storageRoot,
-		storageBackend:        storageBackend,
-		storageHostPath:       storageHostPath,
-		iamRole:               iamRole,
-		imagePullSecret:       imagePullSecret,
-		noExposeDockerSocket:  noExposeDockerSocket,
-		reporter:              reporter,
-		workerUsesRoot:        workerUsesRoot,
-		pipelines:             ppsdb.Pipelines(env.GetEtcdClient(), etcdPrefix),
-		jobs:                  ppsdb.Jobs(env.GetEtcdClient(), etcdPrefix),
-		monitorCancels:        make(map[string]func()),
-		workerGrpcPort:        workerGrpcPort,
-		port:                  port,
-		httpPort:              httpPort,
-		peerPort:              peerPort,
+		Logger:                 log.NewLogger("pps.API"),
+		env:                    env,
+		txnEnv:                 txnEnv,
+		etcdPrefix:             etcdPrefix,
+		namespace:              namespace,
+		workerImage:            workerImage,
+		workerSidecarImage:     workerSidecarImage,
+		workerImagePullPolicy:  workerImagePullPolicy,
+		storageRoot:            storageRoot,
+		storageBackend:         storageBackend,
+		storageHostPath:        storageHostPath,
+		iamRole:                iamRole,
+		imagePullSecret:        imagePullSecret,
+		noExposeDockerSocket:   noExposeDockerSocket,
+		reporter:               reporter,
+		workerUsesRoot:         workerUsesRoot,
+		pipelines:              ppsdb.Pipelines(env.GetEtcdClient(), etcdPrefix),
+		jobs:                   ppsdb.Jobs(env.GetEtcdClient(), etcdPrefix),
+		monitorCancels:         make(map[string]func()),
+		crashingMonitorCancels: make(map[string]func()),
+		workerGrpcPort:         workerGrpcPort,
+		port:                   port,
+		httpPort:               httpPort,
+		peerPort:               peerPort,
 	}
 	apiServer.validateKube()
 	go apiServer.master()
@@ -72,7 +73,9 @@ func NewAPIServer(
 // create pipelines.
 func NewSidecarAPIServer(
 	env *serviceenv.ServiceEnv,
+	txnEnv *txnenv.TransactionEnv,
 	etcdPrefix string,
+	namespace string,
 	iamRole string,
 	reporter *metrics.Reporter,
 	workerGrpcPort uint16,
@@ -82,9 +85,11 @@ func NewSidecarAPIServer(
 	apiServer := &apiServer{
 		Logger:         log.NewLogger("pps.API"),
 		env:            env,
+		txnEnv:         txnEnv,
 		etcdPrefix:     etcdPrefix,
 		iamRole:        iamRole,
 		reporter:       reporter,
+		namespace:      namespace,
 		workerUsesRoot: true,
 		pipelines:      ppsdb.Pipelines(env.GetEtcdClient(), etcdPrefix),
 		jobs:           ppsdb.Jobs(env.GetEtcdClient(), etcdPrefix),
@@ -92,5 +97,6 @@ func NewSidecarAPIServer(
 		httpPort:       httpPort,
 		peerPort:       peerPort,
 	}
+	go apiServer.ServeSidecarS3G()
 	return apiServer, nil
 }
